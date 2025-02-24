@@ -428,6 +428,66 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
 
                 nodes[pos:pos + 1] = new_node
                 continue
+            case ast.Import(names):
+                new_node = []
+                for import_name in names:
+                    name, asname = import_name.name, import_name.asname
+                    if asname is None:
+                        asname = name
+                    new_node.append(
+                        ast.Assign(
+                            targets=[ast.Name(id=asname, ctx=ast.Store())],
+                            value=ast.Call(
+                                func=ast.Name(id='__import__', ctx=ast.Load()),
+                                args=[
+                                    ast.Constant(value=name),
+                                ],
+                                keywords=[],
+                            ),
+                        )
+                    )
+                nodes[pos:pos+1] = new_node
+                continue
+            case ast.ImportFrom(module, names, _):
+                new_node = []
+                temp_node_var = get_temp_var()
+                new_node.append(
+                    ast.Assign(
+                        targets=[ast.Name(id=temp_node_var, ctx=ast.Store())],
+                        value=ast.Call(
+                            func=ast.Name(id='__import__', ctx=ast.Load()),
+                            args=[
+                                ast.Constant(value=module),
+                            ],
+                            keywords=[
+                                ast.keyword(
+                                    arg='fromlist',
+                                    value=ast.Constant(
+                                        [
+                                            module,
+                                        ]
+                                    ),
+                                )
+                            ],
+                        ),
+                    )
+                )
+                for import_name in names:
+                    name, asname = import_name.name, import_name.asname
+                    if asname is None:
+                        asname = name
+                    new_node.append(
+                        ast.Assign(
+                            targets=[ast.Name(id=asname, ctx=ast.Store())],
+                            value=ast.Attribute(
+                                value=ast.Name(id=temp_node_var, ctx=ast.Load()),
+                                attr=name,
+                                ctx=ast.Load(),
+                            ),
+                        )
+                    )
+                nodes[pos:pos+1] = new_node
+                continue
 
             case _:
                 raise NotImplementedError(f"Not implemented for type {type(node)}")
