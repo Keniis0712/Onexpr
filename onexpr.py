@@ -6,6 +6,19 @@ import consts
 from consts import get_temp_var
 
 
+# stmt = AsyncFunctionDef(identifier name, arguments args, stmt* body, expr* decorator_list, expr? returns, string? type_comment, type_param* type_params)
+#      | TypeAlias(expr name, type_param* type_params, expr value)  # Not support
+#      | AnnAssign(expr target, expr annotation, expr? value, int simple)  # Not support
+#      | AsyncFor(expr target, expr iter, stmt* body, stmt* orelse, string? type_comment)
+#      | With(withitem* items, stmt* body, string? type_comment)
+#      | AsyncWith(withitem* items, stmt* body, string? type_comment)
+#      | Match(expr subject, match_case* cases)
+#      | Try(stmt* body, excepthandler* handlers, stmt* orelse, stmt* finalbody)
+#      | TryStar(stmt* body, excepthandler* handlers, stmt* orelse, stmt* finalbody)
+#      | Global(identifier* names)
+#      | Nonlocal(identifier* names)
+
+
 class ASTNodeFinder(ast.NodeVisitor):
     def __init__(self):
         self.nodes = {}
@@ -19,12 +32,14 @@ class ExprWithoutProcess(ast.Expr):
     ...
 
 
-def parse_root(node: ast.AST) -> ast.AST:
+def parse_root(node: ast.Module) -> ast.Module:
     assert isinstance(node, ast.Module)  # Top layer should be module
     finder = ASTNodeFinder()
     finder.visit(node)
 
     body = []
+    if finder.nodes.get(ast.Nonlocal, False):
+        body.append(consts.nonlocal_inspect_import)
     if finder.nodes.get(ast.For, False):
         body.append(consts.for_class)
     if finder.nodes.get(ast.While, False):
@@ -32,21 +47,54 @@ def parse_root(node: ast.AST) -> ast.AST:
 
     body.extend(node.body)
 
-    return (
-        ast.Module(
-            body=[
-                ast.Expr(
-                    value=parse_sub(body)
-                )
-            ],
-            type_ignores=[],
-        )
+    return ast.Module(
+        body=[
+            ast.Expr(
+                value=parse_sub(body, True, [])
+            )
+        ],
+        type_ignores=[],
     )
 
 
-def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
+def is_using_nonlocal(nodes: list[ast.stmt]) -> list[str]:
+    names = []
+    for node in nodes:
+        match node:
+            case ast.Nonlocal(name):
+                names.extend(name)
+            case ast.FunctionDef() | ast.AsyncFunctionDef() | ast.ClassDef():
+                continue
+            case ast.If(_, body, orelse):
+                names.extend(is_using_nonlocal(body))
+                names.extend(is_using_nonlocal(orelse))
+            case ast.While(_, body, orelse):
+                names.extend(is_using_nonlocal(body))
+                names.extend(is_using_nonlocal(orelse))
+            case ast.For(_, _, body, orelse):
+                names.extend(is_using_nonlocal(body))
+                names.extend(is_using_nonlocal(orelse))
+            case ast.Try(body, handlers, orelse, finalbody):
+                names.extend(is_using_nonlocal(body))
+                for handler in handlers:
+                    names.extend(is_using_nonlocal(handler.body))
+                names.extend(is_using_nonlocal(orelse))
+                names.extend(is_using_nonlocal(finalbody))
+            case ast.With(_, body, _):
+                names.extend(is_using_nonlocal(body))
+            case ast.Match(_, cases):
+                for case in cases:
+                    names.extend(is_using_nonlocal(case))
+            case _:
+                continue
+    return names
+
+
+def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) -> ast.BoolOp:
     exprs = []
     pos = 0
+    if new_scoop:
+        nonlocal_name = is_using_nonlocal(nodes)
     while pos < len(nodes):
         node = nodes[pos]
 
@@ -58,7 +106,7 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
                         value,
                         ast.Constant(value=False),
                     ],
-                ) if isinstance(value, ast.Expr) else value
+                ) if type(node) is ast.Expr else value
                 exprs.append(expr)
             case ast.Assign(targets, value):
                 if len(targets) > 1:
@@ -220,16 +268,46 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
 
                 # Now the assign is like `a = 1`
                 if isinstance(target, ast.Name):
-                    expr = ast.BoolOp(
-                        op=ast.And(),
-                        values=[
-                            ast.NamedExpr(
-                                target=target,
-                                value=value,
+                    if target.id not in nonlocal_name:
+                        expr = ast.BoolOp(
+                            op=ast.And(),
+                            values=[
+                                ast.NamedExpr(
+                                    target=target,
+                                    value=value,
+                                ),
+                                ast.Constant(value=False),
+                            ],
+                        )
+                    else:
+                        expr = ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Attribute(
+                                    value=ast.Attribute(
+                                        value=ast.Call(
+                                            func=ast.Attribute(
+                                                value=ast.Name(id=consts.nonlocal_inspect_name, ctx=ast.Load()),
+                                                attr='currentframe',
+                                                ctx=ast.Load()
+                                            ),
+                                            args=[],
+                                            keywords=[]
+                                        ),
+                                        attr='f_back',
+                                        ctx=ast.Load()
+                                    ),
+                                    attr='f_locals',
+                                    ctx=ast.Load()
+                                ),
+                                attr='__setitem__',
+                                ctx=ast.Load()
                             ),
-                            ast.Constant(value=False),
-                        ],
-                    )
+                            args=[
+                                ast.Constant(value=target.id),
+                                value,
+                            ],
+                            keywords=[],
+                        )
                 elif isinstance(target, ast.Attribute):
                     expr = ast.Call(
                         func=ast.Name(id='setattr', ctx=ast.Load()),
@@ -240,8 +318,21 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
                         ],
                         keywords=[],
                     )
+                elif isinstance(target, ast.Subscript):
+                    expr = ast.Call(
+                        func=ast.Attribute(
+                            value=target.value,
+                            attr='__setitem__',
+                            ctx=ast.Load(),
+                        ),
+                        args=[
+                            target.slice,
+                            value,
+                        ],
+                        keywords=[],
+                    )
                 else:
-                    raise NotImplementedError
+                    raise NotImplementedError(type(target))
                 exprs.append(expr)
             case ast.FunctionDef(name, args, body, decorators):
                 if not isinstance(body[-1], ast.Return):
@@ -252,7 +343,7 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
                         value=ast.Lambda(
                             args=args,
                             body=ast.Subscript(
-                                value=parse_sub(body),
+                                value=parse_sub(body, True, []),
                                 slice=ast.Constant(value=1),
                                 ctx=ast.Load(),
                             ),
@@ -278,8 +369,8 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
                 exprs.append(
                     ast.IfExp(
                         test=test,
-                        body=parse_sub(body),
-                        orelse=parse_sub(orelse),
+                        body=parse_sub(body, False, nonlocal_name),
+                        orelse=parse_sub(orelse, False, nonlocal_name),
                     )
                 )
             case ast.ClassDef(name, bases, keywords, body, decorators):
@@ -308,6 +399,8 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
                                          ),
                                          body=parse_sub(
                                              body,
+                                             True,
+                                             []
                                          ),
                                      ),
                                      ast.Constant(value=name),
@@ -349,7 +442,7 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
                                     target=target,
                                     iter=ast.Name(id=consts.for_obj_name, ctx=ast.Load()),
                                     ifs=[
-                                        parse_sub(body)
+                                        parse_sub(body, False, nonlocal_name)
                                     ],
                                     is_async=0,
                                 )
@@ -360,7 +453,7 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
 
                 if orelse:
                     new_node.append(
-                        gen_orelse(orelse)
+                        gen_orelse(orelse, nonlocal_name)
                     )
 
                 nodes[pos:pos + 1] = new_node
@@ -413,7 +506,7 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
                                     target=ast.Name(id='_', ctx=ast.Store()),
                                     iter=ast.Name(id=consts.while_obj_name, ctx=ast.Load()),
                                     ifs=[
-                                        parse_sub(body_ast)
+                                        parse_sub(body_ast, False, nonlocal_name)
                                     ],
                                     is_async=0,
                                 )
@@ -423,7 +516,7 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
                 ]
                 if orelse:
                     orelse.append(
-                        gen_orelse(orelse)
+                        gen_orelse(orelse, nonlocal_name)
                     )
 
                 nodes[pos:pos + 1] = new_node
@@ -446,7 +539,7 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
                             ),
                         )
                     )
-                nodes[pos:pos+1] = new_node
+                nodes[pos:pos + 1] = new_node
                 continue
             case ast.ImportFrom(module, names, _):
                 new_node = []
@@ -486,8 +579,140 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
                             ),
                         )
                     )
-                nodes[pos:pos+1] = new_node
+                nodes[pos:pos + 1] = new_node
                 continue
+            case ast.Pass():
+                exprs.append(
+                    ast.Constant(value=...)
+                )
+            case ast.Raise(exc, cause):
+                if cause is None:
+                    exprs.append(
+                        ast.Expr(
+                            value=ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.GeneratorExp(
+                                        elt=ast.Constant(value=0),
+                                        generators=[
+                                            ast.comprehension(
+                                                target=ast.Name(id='_', ctx=ast.Store()),
+                                                iter=ast.Tuple(elts=[], ctx=ast.Load()),
+                                                ifs=[],
+                                                is_async=0
+                                            )
+                                        ]
+                                    ),
+                                    attr='throw',
+                                    ctx=ast.Load()
+                                ),
+                                args=[
+                                    ast.Call(
+                                        func=ast.Attribute(
+                                            value=exc,
+                                            attr='with_traceback',
+                                            ctx=ast.Load()
+                                        ),
+                                        args=[
+                                            ast.Attribute(
+                                                value=exc,
+                                                attr='__traceback__',
+                                                ctx=ast.Load()
+                                            )
+                                        ] if exc else [
+                                            ast.Constant(value=None)
+                                        ],
+                                        keywords=[]
+                                    )
+                                ],
+                                keywords=[]
+                            )
+                        )
+                    )
+            case ast.Assert(test, msg):
+                nodes[pos:pos + 1] = [
+                    ast.If(
+                        test=ast.UnaryOp(
+                            op=ast.Not(),
+                            operand=test,
+                        ),
+                        body=[
+                            ast.Raise(
+                                exc=ast.Call(
+                                    func=ast.Name(id='AssertionError', ctx=ast.Load()),
+                                    args=[
+                                        msg,
+                                    ],
+                                    keywords=[],
+                                )
+                            )
+                        ],
+                        orelse=[
+                            ast.Expr(
+                                ast.Constant(value=None)
+                            )
+                        ],
+                    )
+                ]
+                continue
+            case ast.Delete(targets):
+                new_node = []
+                for target in targets:
+                    if isinstance(target, ast.Attribute):
+                        new_node.append(
+                            ast.Call(
+                                func=ast.Name(
+                                    id='delattr',
+                                    ctx=ast.Load(),
+                                ),
+                                args=[
+                                    target.value,
+                                    ast.Constant(value=target.attr),
+                                ],
+                                keywords=[],
+                            )
+                        )
+                    elif isinstance(target, ast.Subscript):
+                        new_node.append(
+                            ast.Assign(
+                                targets=[
+                                    ast.Subscript(
+                                        value=target.value,
+                                        slice=ast.Slice(
+                                            lower=target.slice.value,
+                                            upper=target.slice.value + 1
+                                        ),
+                                        ctx=ast.Store(),
+                                    )
+                                ],
+                                value=ast.Constant(value=[]),
+                            )
+                        )
+                    elif isinstance(target, ast.Name):
+                        new_node.append(
+                            ast.Expr(
+                                ast.Call(
+                                    func=ast.Attribute(
+                                        value=ast.Call(
+                                            func=ast.Name(id='locals', ctx=ast.Load()),
+                                            args=[],
+                                            keywords=[],
+                                        ),
+                                        attr='pop',
+                                        ctx=ast.Load(),
+                                    ),
+                                    args=[
+                                        ast.Constant(value=target.id),
+                                    ],
+                                    keywords=[],
+                                )
+                            )
+                        )
+                    else:
+                        raise NotImplementedError(f"Not implemented for type {type(target)}")
+                nodes[pos:pos + 1] = new_node
+                continue
+            case ast.Nonlocal(_):
+                ...
 
             case _:
                 raise NotImplementedError(f"Not implemented for type {type(node)}")
@@ -500,7 +725,7 @@ def parse_sub(nodes: list[ast.stmt]) -> ast.BoolOp:
     )
 
 
-def gen_orelse(orelse):
+def gen_orelse(orelse, use_nonlocal):
     return ast.Expr(
         value=ast.IfExp(
             test=ast.Attribute(
@@ -509,7 +734,7 @@ def gen_orelse(orelse):
                 ctx=ast.Load(),
             ),
             body=ast.Constant(value=None),
-            orelse=parse_sub(orelse),
+            orelse=parse_sub(orelse, False, use_nonlocal),
         )
     )
 

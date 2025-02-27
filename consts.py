@@ -317,6 +317,16 @@ while_class = ast.ClassDef(
 )
 while_obj_name = '__onexpr_while_helper_obj' if not debug_mode else 'while_obj'
 
+nonlocal_inspect_name = '__onexpr_nonlocal_inspect' if not debug_mode else 'inspect_lib'
+nonlocal_inspect_import = ast.Import(
+    names=[
+        ast.alias(
+            name='inspect',
+            asname=nonlocal_inspect_name
+        )
+    ]
+)
+
 temp_var_counter = 0
 
 
