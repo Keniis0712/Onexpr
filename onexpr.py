@@ -5,18 +5,18 @@ import os.path
 import consts
 from consts import get_temp_var
 
-
-# stmt = AsyncFunctionDef(identifier name, arguments args, stmt* body, expr* decorator_list, expr? returns, string? type_comment, type_param* type_params)
-#      | TypeAlias(expr name, type_param* type_params, expr value)  # Not support
-#      | AnnAssign(expr target, expr annotation, expr? value, int simple)  # Not support
-#      | AsyncFor(expr target, expr iter, stmt* body, stmt* orelse, string? type_comment)
-#      | With(withitem* items, stmt* body, string? type_comment)
-#      | AsyncWith(withitem* items, stmt* body, string? type_comment)
-#      | Match(expr subject, match_case* cases)
-#      | Try(stmt* body, excepthandler* handlers, stmt* orelse, stmt* finalbody)
-#      | TryStar(stmt* body, excepthandler* handlers, stmt* orelse, stmt* finalbody)
-#      | Global(identifier* names)
-#      | Nonlocal(identifier* names)
+"""
+     | AsyncFunctionDef(identifier name, arguments args, stmt* body, expr* decorator_list, expr? returns, string? type_comment, type_param* type_params)
+     | TypeAlias(expr name, type_param* type_params, expr value)
+     | AnnAssign(expr target, expr annotation, expr? value, int simple)
+     | AsyncFor(expr target, expr iter, stmt* body, stmt* orelse, string? type_comment)
+     | With(withitem* items, stmt* body, string? type_comment)
+     | AsyncWith(withitem* items, stmt* body, string? type_comment)
+     | Match(expr subject, match_case* cases)
+     | Try(stmt* body, excepthandler* handlers, stmt* orelse, stmt* finalbody)
+     | TryStar(stmt* body, excepthandler* handlers, stmt* orelse, stmt* finalbody)
+     | Global(identifier* names)
+"""
 
 
 class ASTNodeFinder(ast.NodeVisitor):
@@ -44,6 +44,9 @@ def parse_root(node: ast.Module) -> ast.Module:
         body.append(consts.for_class)
     if finder.nodes.get(ast.While, False):
         body.append(consts.while_class)
+    if finder.nodes.get(ast.Try, False):
+        body.append(consts.try_types_import)
+        body.append(consts.try_asyncio_import)
 
     body.extend(node.body)
 
@@ -93,6 +96,7 @@ def is_using_nonlocal(nodes: list[ast.stmt]) -> list[str]:
 def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) -> ast.BoolOp:
     exprs = []
     pos = 0
+    local_vars = []
     if new_scoop:
         nonlocal_name = is_using_nonlocal(nodes)
     while pos < len(nodes):
@@ -269,6 +273,7 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                 # Now the assign is like `a = 1`
                 if isinstance(target, ast.Name):
                     if target.id not in nonlocal_name:
+                        local_vars.append(target.id)
                         expr = ast.BoolOp(
                             op=ast.And(),
                             values=[
@@ -337,7 +342,7 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
             case ast.FunctionDef(name, args, body, decorators):
                 if not isinstance(body[-1], ast.Return):
                     body.append(ast.Return(value=ast.Constant(value=None)))
-                new_node = [
+                new_nodes = [
                     ast.Assign(
                         targets=[ast.Name(id=name, ctx=ast.Store())],
                         value=ast.Lambda(
@@ -350,8 +355,8 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                         ),
                     )
                 ]
-                new_node.extend(add_decorators(decorators, name))
-                nodes[pos:pos + 1] = new_node
+                new_nodes.extend(add_decorators(decorators, name))
+                nodes[pos:pos + 1] = new_nodes
                 continue
             case ast.Return(value):
                 exprs.append(
@@ -383,7 +388,7 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                         )
                     )
                 )
-                new_node = [
+                new_nodes = [
                     ast.Assign(
                         targets=[ast.Name(id=name, ctx=ast.Store())],
                         value=ast.Call(
@@ -409,8 +414,8 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                         ),
                     )
                 ]
-                new_node.extend(add_decorators(decorators, name))
-                nodes[pos:pos + 1] = new_node
+                new_nodes.extend(add_decorators(decorators, name))
+                nodes[pos:pos + 1] = new_nodes
                 continue
             case ast.AugAssign(target, op, value):
                 nodes[pos:pos + 1] = [
@@ -425,7 +430,7 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                 ]
                 continue
             case ast.For(target, iter_, body, orelse):
-                new_node = [
+                new_nodes = [
                     ast.Assign(
                         targets=[ast.Name(id=consts.for_obj_name, ctx=ast.Store())],
                         value=ast.Call(
@@ -452,11 +457,11 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                 ]
 
                 if orelse:
-                    new_node.append(
+                    new_nodes.append(
                         gen_orelse(orelse, nonlocal_name)
                     )
 
-                nodes[pos:pos + 1] = new_node
+                nodes[pos:pos + 1] = new_nodes
                 continue
             case ast.Break():
                 exprs.append(
@@ -489,7 +494,7 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                     )
                 ]
                 body_ast.extend(body)
-                new_node = [
+                new_nodes = [
                     ast.Assign(
                         targets=[ast.Name(id=consts.while_obj_name, ctx=ast.Store())],
                         value=ast.Call(
@@ -519,15 +524,15 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                         gen_orelse(orelse, nonlocal_name)
                     )
 
-                nodes[pos:pos + 1] = new_node
+                nodes[pos:pos + 1] = new_nodes
                 continue
             case ast.Import(names):
-                new_node = []
+                new_nodes = []
                 for import_name in names:
                     name, asname = import_name.name, import_name.asname
                     if asname is None:
                         asname = name
-                    new_node.append(
+                    new_nodes.append(
                         ast.Assign(
                             targets=[ast.Name(id=asname, ctx=ast.Store())],
                             value=ast.Call(
@@ -539,12 +544,12 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                             ),
                         )
                     )
-                nodes[pos:pos + 1] = new_node
+                nodes[pos:pos + 1] = new_nodes
                 continue
             case ast.ImportFrom(module, names, _):
-                new_node = []
+                new_nodes = []
                 temp_node_var = get_temp_var()
-                new_node.append(
+                new_nodes.append(
                     ast.Assign(
                         targets=[ast.Name(id=temp_node_var, ctx=ast.Store())],
                         value=ast.Call(
@@ -569,7 +574,7 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                     name, asname = import_name.name, import_name.asname
                     if asname is None:
                         asname = name
-                    new_node.append(
+                    new_nodes.append(
                         ast.Assign(
                             targets=[ast.Name(id=asname, ctx=ast.Store())],
                             value=ast.Attribute(
@@ -579,7 +584,7 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                             ),
                         )
                     )
-                nodes[pos:pos + 1] = new_node
+                nodes[pos:pos + 1] = new_nodes
                 continue
             case ast.Pass():
                 exprs.append(
@@ -655,10 +660,10 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                 ]
                 continue
             case ast.Delete(targets):
-                new_node = []
+                new_nodes = []
                 for target in targets:
                     if isinstance(target, ast.Attribute):
-                        new_node.append(
+                        new_nodes.append(
                             ast.Call(
                                 func=ast.Name(
                                     id='delattr',
@@ -672,7 +677,8 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                             )
                         )
                     elif isinstance(target, ast.Subscript):
-                        new_node.append(
+                        # noinspection PyUnresolvedReferences,PyArgumentList
+                        new_nodes.append(
                             ast.Assign(
                                 targets=[
                                     ast.Subscript(
@@ -688,7 +694,7 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                             )
                         )
                     elif isinstance(target, ast.Name):
-                        new_node.append(
+                        new_nodes.append(
                             ast.Expr(
                                 ast.Call(
                                     func=ast.Attribute(
@@ -709,10 +715,270 @@ def parse_sub(nodes: list[ast.stmt], new_scoop: bool, nonlocal_name: list[str]) 
                         )
                     else:
                         raise NotImplementedError(f"Not implemented for type {type(target)}")
-                nodes[pos:pos + 1] = new_node
+                nodes[pos:pos + 1] = new_nodes
                 continue
             case ast.Nonlocal(_):
                 ...
+            case ast.Try(body, handlers, orelse, finalbody):
+                try_func_name = get_temp_var()
+                event_loop_name = get_temp_var()
+                handlers_func_name = get_temp_var()
+                finallybody_func_name = get_temp_var() if finalbody else None
+                orelse_func_name = get_temp_var() if orelse else None
+
+                handlers_body = [
+                    ast.Assign(
+                        targets=[
+                            ast.Name(id='exception', ctx=ast.Store())
+                        ],
+                        value=ast.Subscript(
+                            value=ast.Name(id='context', ctx=ast.Load()),
+                            slice=ast.Constant(value='exception'),
+                            ctx=ast.Load()
+                        )
+                    ),
+                    ast.Expr(
+                        value=ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Name(id='loop', ctx=ast.Load()),
+                                attr='stop',
+                                ctx=ast.Load()
+                            ),
+                            args=[],
+                            keywords=[]
+                        )
+                    )
+                ]
+                if handlers:
+                    if_block = ast.If(
+                        test=ast.Call(
+                            func=ast.Name(id='isinstance', ctx=ast.Load()),
+                            args=[
+                                ast.Name(id='exception', ctx=ast.Load()),
+                                handlers[0].type
+                            ],
+                            keywords=[]
+                        ),
+                        body=handlers[0].body
+                    )
+                    next_if = if_block
+                    for handler in handlers[1:]:
+                        new_if = ast.If(
+                            test=ast.Call(
+                                func=ast.Name(id='isinstance', ctx=ast.Load()),
+                                args=[
+                                    ast.Name(id='exception', ctx=ast.Load()),
+                                    handler.type
+                                ],
+                                keywords=[]
+                            ) if handler.type else ast.Constant(value=True),
+                            body=handler.body
+                        )
+                        next_if.orelse = [new_if]
+                        next_if = new_if
+                    next_if.orelse=[ast.Expr(value=ast.Constant(value=None))]
+                    handlers_body.append(if_block)
+                if finallybody_func_name:
+                    handlers_body.append(
+                        ast.Expr(
+                            value=ast.Call(
+                                func=ast.Name(id=finallybody_func_name, ctx=ast.Load()),
+                                args=[],
+                                keywords=[]
+                            )
+                        )
+                    )
+
+                new_nodes = [
+                    ast.FunctionDef(
+                        name=try_func_name,
+                        args=ast.arguments(
+                            posonlyargs=[],
+                            args=[],
+                            kwonlyargs=[],
+                            kw_defaults=[],
+                            defaults=[]
+                        ),
+                        body=[
+                            ast.Expr(value=parse_sub(body, False, local_vars))
+                        ],  # May change the local variant in the body, so we use nonlocal to avoid it
+                        decorator_list=[],
+                        type_params=[]
+                    ),
+                    ast.FunctionDef(
+                        name=handlers_func_name,
+                        args=ast.arguments(
+                            posonlyargs=[],
+                            args=[
+                                ast.arg(arg='loop'),
+                                ast.arg(arg='context')
+                            ],
+                            kwonlyargs=[],
+                            kw_defaults=[],
+                            defaults=[]
+                        ),
+                        body=handlers_body
+                    )
+                ]
+
+                if finalbody:
+                    new_nodes.append(
+                        ast.FunctionDef(
+                            name=finallybody_func_name,
+                            args=ast.arguments(
+                                posonlyargs=[],
+                                args=[],
+                                kwonlyargs=[],
+                                kw_defaults=[],
+                                defaults=[]
+                            ),
+                            body=[
+                                ast.Expr(value=parse_sub(finalbody, False, local_vars))
+                            ],
+                            decorator_list=[],
+                            type_params=[]
+                        )
+                    )
+                if orelse:
+                    new_nodes.append(
+                        ast.FunctionDef(
+                            name=orelse_func_name,
+                            args=ast.arguments(
+                                posonlyargs=[],
+                                args=[],
+                                kwonlyargs=[],
+                                kw_defaults=[],
+                                defaults=[]
+                            ),
+                            body=[
+                                ast.Expr(value=parse_sub(orelse, False, local_vars))
+                            ],
+                            decorator_list=[],
+                            type_params=[]
+                        )
+                    )
+
+                gen_nodes = [
+                    ast.Expr(
+                        value=ast.Call(
+                            func=ast.Name(id=try_func_name, ctx=ast.Load()),
+                            args=[],
+                            keywords=[]
+                        )
+                    ),
+                    ast.Expr(
+                        value=ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Name(id=event_loop_name, ctx=ast.Load()),
+                                attr='stop',
+                                ctx=ast.Load()
+                            ),
+                            args=[],
+                            keywords=[]
+                        )
+                    ),
+
+                ]
+                if finalbody:
+                    gen_nodes.append(
+                        ast.Expr(
+                            value=ast.Call(
+                                func=ast.Name(id=finallybody_func_name, ctx=ast.Load()),
+                                args=[],
+                                keywords=[]
+                            )
+                        )
+                    )
+                if orelse:
+                    gen_nodes.append(
+                        ast.Expr(
+                            value=ast.Call(
+                                func=ast.Name(id=orelse_func_name, ctx=ast.Load()),
+                                args=[],
+                                keywords=[]
+                            )
+                        )
+                    )
+                new_nodes.extend(
+                    [
+                        ast.Assign(
+                            targets=[
+                                ast.Name(id=event_loop_name, ctx=ast.Store())
+                            ],
+                            value=ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Name(consts.try_asyncio_name),
+                                    attr='new_event_loop',
+                                    ctx=ast.Load()
+                                ),
+                                args=[],
+                                keywords=[]
+                            )
+                        ),
+                        ast.Expr(
+                            value=ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Name(id=event_loop_name, ctx=ast.Load()),
+                                    attr='set_exception_handler',
+                                    ctx=ast.Load()
+                                ),
+                                args=[
+                                    ast.Name(id=handlers_func_name, ctx=ast.Load())
+                                ],
+                                keywords=[]
+                            )
+                        ),
+                        ast.Expr(
+                            value=ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Name(id=event_loop_name, ctx=ast.Load()),
+                                    attr='call_soon_threadsafe',
+                                    ctx=ast.Load()
+                                ),
+                                args=[
+                                    ast.Call(
+                                        func=ast.Attribute(
+                                            value=ast.Name(id=consts.try_types_name, ctx=ast.Load()),
+                                            attr='coroutine',
+                                            ctx=ast.Load()
+                                        ),
+                                        args=[
+                                            ast.Lambda(
+                                                args=ast.arguments(
+                                                    posonlyargs=[],
+                                                    args=[],
+                                                    kwonlyargs=[],
+                                                    kw_defaults=[],
+                                                    defaults=[]
+                                                ),
+                                                body=parse_sub(
+                                                    gen_nodes,
+                                                    False,
+                                                    []
+                                                )
+                                            )
+                                        ],
+                                        keywords=[]
+                                    )
+                                ],
+                                keywords=[]
+                            )
+                        ),
+                        ast.Expr(
+                            value=ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Name(id=event_loop_name, ctx=ast.Load()),
+                                    attr='run_forever',
+                                    ctx=ast.Load()
+                                ),
+                                args=[],
+                                keywords=[]
+                            )
+                        )
+                    ]
+                )
+                nodes[pos:pos + 1] = new_nodes
+                continue
 
             case _:
                 raise NotImplementedError(f"Not implemented for type {type(node)}")

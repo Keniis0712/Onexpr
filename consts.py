@@ -1,6 +1,6 @@
 import ast
 
-debug_mode = 1
+debug_mode = 0
 
 for_name = '__onexpr_for_helper' if not debug_mode else 'for_cls'
 for_class = ast.ClassDef(
@@ -323,6 +323,25 @@ nonlocal_inspect_import = ast.Import(
         ast.alias(
             name='inspect',
             asname=nonlocal_inspect_name
+        )
+    ]
+)
+
+try_asyncio_name = '__onexpr_try_asyncio' if not debug_mode else 'asyncio_lib'
+try_asyncio_import = ast.Import(
+    names=[
+        ast.alias(
+            name='asyncio',
+            asname=try_asyncio_name
+        )
+    ]
+)
+try_types_name = '__onexpr_try_types' if not debug_mode else 'types_lib'
+try_types_import = ast.Import(
+    names=[
+        ast.alias(
+            name='types',
+            asname=try_types_name
         )
     ]
 )
