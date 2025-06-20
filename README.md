@@ -10,6 +10,3 @@ It can be just for fun, but can also be used to obfuscate the code
 ```bash
 $ ./onexpr.py --input my_program.py --output obfuscated.py
 ```
-
-## Defect
-- It still can't use`break` or the similar statements in `try` block.
