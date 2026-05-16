@@ -24,6 +24,22 @@ def _get_try_helper_body() -> list:
     return _load_runtime_module('try_helper.py')
 
 
+def _get_typealias_body() -> list:
+    return _load_runtime_module('typealias.py')
+
+
+def _has_pep695(tree: ast.AST) -> bool:
+    """True iff the tree uses PEP 695 syntax: `type X = ...`,
+    `def f[T](...)`, or `class C[T]:`."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.TypeAlias):
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if getattr(node, 'type_params', None):
+                return True
+    return False
+
+
 def _has_generator_function(tree: ast.AST) -> bool:
     """True iff the tree contains a FunctionDef whose body uses
     yield / yield from directly (not in a nested function)."""
@@ -213,5 +229,8 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
     # through the full onexpr transformation along with user code.
     if needs_try_runtime:
         to_insert = to_insert + _get_try_helper_body()
+
+    if _has_pep695(tree):
+        to_insert = to_insert + _get_typealias_body()
 
     tree.body = to_insert + tree.body

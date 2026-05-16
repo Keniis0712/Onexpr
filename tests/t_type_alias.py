@@ -1,49 +1,38 @@
-type X = int
-
-# onexpr's simplified type alias: `type X = int` becomes `X = int`
-# (not a TypeAliasType). We test that the alias is usable.
-x: X = 10
-print(x)
+import typing
 
 
-type Vector = list[float]
-
-v: Vector = [1.0, 2.0]
-print(v)
-
-
-type IntList = list[int]
-v2: IntList = [1, 2, 3]
-print(v2)
+# 1) Plain alias: round-trip prints type, value, type_params, isinstance.
+type X = list[int]
+print(type(X).__name__ in ('TypeAliasType', '_LazyAlias'))
+print(X.__value__)
+print(X.__type_params__)
+print(isinstance(X, typing.TypeAliasType))
 
 
+# 2) Generic alias.
 type Pair[T] = tuple[T, T]
+print(Pair.__type_params__[0].__class__.__name__)
+print(Pair.__value__)
+print(isinstance(Pair, typing.TypeAliasType))
 
-# Type params become typing.TypeVar at runtime in onexpr's transform.
-p: Pair = (1, 1)
-print(p)
+
+# 3) Type vars do NOT leak into the surrounding scope.
+type Inner[Q] = list[Q]
+print('Q' in dir())
 
 
+# 4) Subscripting an alias.
+type Box[T] = list[T]
+print(Box[int])
+
+
+# 5) Multiple type vars.
 type Result[T, E] = T | E
-
-# Union types work at runtime for isinstance in 3.10+.
+print(len(Result.__type_params__))
 print(isinstance(1, int | str))
 
 
-type Number = int | float
-
-
-def is_number(x):
-    return isinstance(x, (int, float))
-
-
-print(is_number(1))
-print(is_number(2.5))
-print(is_number('hi'))
-
-
-# Used as type hint in a function (not at runtime, but onexpr should
-# at least parse and run the runtime aliasing without crashing).
+# 6) Used as a type hint at runtime — lookup must not crash.
 type Greeter = str
 
 
@@ -54,7 +43,7 @@ def greet(name: Greeter) -> str:
 print(greet('world'))
 
 
-# Inside a class
+# 7) Inside a class.
 class Container:
     type Item = int
 
@@ -69,3 +58,31 @@ c = Container()
 c.add(1)
 c.add(2)
 print(c.items)
+
+
+# 8) Lazy evaluation: RHS is not evaluated until __value__ is read.
+type Lazy = Undefined  # noqa: F821 — name doesn't exist yet
+try:
+    Lazy.__value__
+except NameError:
+    print('lazy ok')
+
+
+# 9) ParamSpec.
+type Cb[**P] = typing.Callable[P, int]
+print(type(Cb.__type_params__[0]).__name__)
+
+
+# 10) TypeVarTuple.
+type Tup[*Ts] = tuple[*Ts]
+print(type(Tup.__type_params__[0]).__name__)
+
+
+# 11) TypeVar with bound.
+type Bounded[T: int] = list[T]
+print(Bounded.__type_params__[0].__bound__)
+
+
+# 12) TypeVar with constraints.
+type Constrained[T: (int, str)] = list[T]
+print(Constrained.__type_params__[0].__constraints__)
