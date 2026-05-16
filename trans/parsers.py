@@ -127,6 +127,16 @@ def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
 
 
 def parse_function_def(stmt: ast.FunctionDef, frame: Frame) -> list[_ast.AST]:
+    # Generator function (body has yield)? Compile to a state-machine
+    # class instead of a lambda. We delegate to gen_compile, which
+    # returns a list of statements (the class def + a forwarder
+    # binding the user's name) — those are spliced back in and
+    # processed normally by parse_stmts (so the class itself goes
+    # through parse_class_def, etc.).
+    if _generator_body_has_yield(stmt):
+        from .gen_compile import compile_generator
+        return compile_generator(stmt, frame)
+
     sub_frame = Frame(prev=frame, nonlocal_vars=[], global_vars=[])
     # Inherit legacy mode from the enclosing frame, or pick it up from a
     # transform-time annotation on the FunctionDef itself.
@@ -140,6 +150,24 @@ def parse_function_def(stmt: ast.FunctionDef, frame: Frame) -> list[_ast.AST]:
         box_var = getattr(stmt, '_box_helper_var', None)
         sub_frame.func_helper_var = box_var if box_var is not None else sub_frame.get_temp_var()
     return gen_func(stmt, sub_frame)
+
+
+def _generator_body_has_yield(fdef) -> bool:
+    """True iff fdef's body uses yield / yield from directly, not in
+    a nested function or lambda."""
+    class _V(ast.NodeVisitor):
+        def __init__(self):
+            self.found = False
+        def visit_Lambda(self, node): pass
+        def visit_FunctionDef(self, node): pass
+        def visit_AsyncFunctionDef(self, node): pass
+        def visit_Yield(self, node): self.found = True
+        def visit_YieldFrom(self, node): self.found = True
+
+    v = _V()
+    for s in fdef.body:
+        v.visit(s)
+    return v.found
 
 
 def parse_async_function_def(stmt: ast.AsyncFunctionDef, frame: Frame) -> list[_ast.AST]:

@@ -24,6 +24,29 @@ def _get_try_helper_body() -> list:
     return _load_runtime_module('try_helper.py')
 
 
+def _has_generator_function(tree: ast.AST) -> bool:
+    """True iff the tree contains a FunctionDef whose body uses
+    yield / yield from directly (not in a nested function)."""
+    class _V(ast.NodeVisitor):
+        def __init__(self):
+            self.found = False
+        def visit_Lambda(self, node):
+            pass
+        def visit_Yield(self, node):
+            self.found = True
+        def visit_YieldFrom(self, node):
+            self.found = True
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            v = _V()
+            for s in node.body:
+                v.visit(s)
+                if v.found:
+                    return True
+    return False
+
+
 for_helper_name = '_ForHelper'
 while_helper_name = '_WhileHelper'
 func_helper_name = '_FuncHelper'
@@ -86,7 +109,11 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
         or needs_try_runtime
         or ast.ClassDef in detector.presence  # _make_class iterates bases
     )
-    needs_while = ast.While in detector.presence or needs_try_runtime
+    needs_while = (
+        ast.While in detector.presence
+        or needs_try_runtime
+        or _has_generator_function(tree)  # state machine uses while True
+    )
 
     # Pull in the three core helper classes; each is annotated for the
     # legacy return convention so transforming them doesn't reference
@@ -107,6 +134,21 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
     # including the helper classes we always inject. Always include it.
     if '_make_class' in core_by_name:
         to_insert.append(core_by_name['_make_class'])
+
+    # Generator state machines need a sentinel to distinguish "iterator
+    # exhausted" from "iterator yielded None" — built via next(it,
+    # sentinel). Define it module-level so every generator class can
+    # see it.
+    if _has_generator_function(tree):
+        to_insert.append(
+            ast.Assign(
+                targets=[ast.Name(id='_GEN_DONE_SENTINEL', ctx=ast.Store())],
+                value=ast.Call(
+                    func=ast.Name(id='object', ctx=ast.Load()),
+                    args=[], keywords=[],
+                ),
+            )
+        )
 
     if ast.AsyncFunctionDef in detector.presence:
         to_insert.append(ast.Import(
