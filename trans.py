@@ -107,6 +107,7 @@ def add_deco(name: str, decorators: list[ast.expr], func: _ast.expr) -> ast.expr
         node = ast.Call(
             func=decorator,
             args=[node],
+            keywords=[],
         )
     return node
 
@@ -183,7 +184,8 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
         ast.Return(
             value=ast.Call(
                 func=ast.Name(id='locals', ctx=ast.Load()),
-                args=[]
+                args=[],
+                keywords=[],
             )
         )
     )
@@ -203,7 +205,7 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
                     func=metaclass,
                     args=[
                         ast.Constant(stmt.name),
-                        ast.Tuple(elts=stmt.bases),
+                        ast.Tuple(elts=stmt.bases, ctx=ast.Load()),
                         ast.Subscript(
                             value=ast.Call(
                                 func=ast.Lambda(
@@ -217,11 +219,13 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
                                     ),
                                     body=parse_stmts(cls_body, frame=sub_frame),
                                 ),
-                                args=[]
+                                args=[],
+                                keywords=[],
                             ),
                             slice=ast.Constant(value=0)
                         )
-                    ]
+                    ],
+                    keywords=[],
                 )
             )
         )
@@ -229,8 +233,9 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_return(stmt: ast.Return, frame: Frame) -> list[_ast.AST]:
+    value = stmt.value if stmt.value is not None else ast.Constant(value=None)
     return [
-        ast.Tuple(elts=[stmt.value, ast.Constant(value=True)]),
+        ast.Tuple(elts=[value, ast.Constant(value=True)], ctx=ast.Load()),
     ]
 
 
@@ -354,6 +359,7 @@ def parse_assign(stmt: ast.Assign, frame: Frame) -> list[_ast.AST]:
                         pos,
                         stmt.value
                     ],
+                    keywords=[],
                 )
             )
         ]
@@ -398,7 +404,8 @@ def parse_for(stmt: ast.For, frame: Frame) -> list[_ast.AST]:
             targets=[ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Store())],
             value=ast.Call(
                 func=ast.Name(id=for_helper_name, ctx=ast.Load()),
-                args=[stmt.iter]
+                args=[stmt.iter],
+                keywords=[],
             )
         ),
         ast.Expr(
@@ -433,7 +440,8 @@ def add_orelse(orelse, frame):
                 ctx=ast.Load(),
             )
         ),
-        body=orelse
+        body=orelse,
+        orelse=[],
     )
 
 
@@ -448,8 +456,10 @@ def parse_while(stmt: ast.While, frame: Frame) -> list[_ast.AST]:
             func=ast.Attribute(
                 value=ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load()),
                 attr='cond',
+                ctx=ast.Load(),
             ),
             args=[stmt.test],
+            keywords=[],
         )
     ]
     body += stmt.body
@@ -459,7 +469,8 @@ def parse_while(stmt: ast.While, frame: Frame) -> list[_ast.AST]:
             targets=[ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load())],
             value=ast.Call(
                 func=ast.Name(id=while_helper_name, ctx=ast.Load()),
-                args=[]
+                args=[],
+                keywords=[],
             )
         ),
         ast.Expr(
@@ -537,7 +548,8 @@ def parse_raise(stmt: ast.Raise, frame: Frame) -> list[_ast.AST]:
                         generators=[
                             ast.comprehension(
                                 target=ast.Name(id='_', ctx=ast.Store()),
-                                iter=ast.List(ctx=ast.Load()),
+                                iter=ast.List(elts=[], ctx=ast.Load()),
+                                ifs=[],
                                 is_async=0)
                         ]
                     ),
@@ -546,7 +558,8 @@ def parse_raise(stmt: ast.Raise, frame: Frame) -> list[_ast.AST]:
                 ),
                 args=[
                     ast.Name(id=temp_exc_var, ctx=ast.Load()) if stmt.cause else stmt.exc,
-                ]
+                ],
+                keywords=[],
             )
         )
     ]
@@ -564,15 +577,17 @@ def parse_try_star(stmt: ast.TryStar, frame: Frame) -> list[_ast.AST]:
 def parse_assert(stmt: ast.Assert, frame: Frame) -> list[_ast.AST]:
     return [
         ast.If(
-            test=stmt.test,
+            test=ast.UnaryOp(op=ast.Not(), operand=stmt.test),
             body=[
                 ast.Raise(
                     exc=ast.Call(
                         func=ast.Name(id='AssertionError', ctx=ast.Load()),
-                        args=[stmt.msg]
+                        args=[stmt.msg] if stmt.msg is not None else [],
+                        keywords=[],
                     )
                 )
             ],
+            orelse=[],
         )
     ]
 
@@ -665,7 +680,7 @@ def parse_expr(stmt: ast.Expr, frame: Frame) -> list[_ast.AST]:
 
 def parse_pass(_: ast.Pass, __: Frame) -> list[_ast.AST]:
     return [
-        ast.Constant(value=...),
+        ast.Constant(value=False),
     ]
 
 
@@ -677,7 +692,8 @@ def parse_break(_: ast.Break, frame: Frame) -> list[_ast.AST]:
                 attr='stop',
                 ctx=ast.Load(),
             ),
-            args=[]
+            args=[],
+            keywords=[],
         )
     ]
 
@@ -859,7 +875,8 @@ def add_helper(tree: ast.AST):
                             attr='GeneratorType',
                             ctx=ast.Load()
                         )
-                    ]
+                    ],
+                    keywords=[],
                 )
             )
         )
