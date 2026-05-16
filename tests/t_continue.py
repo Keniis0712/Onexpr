@@ -29,3 +29,33 @@ for i in range(3):
             continue
         print('n', i, j)
 print('after nested')
+
+
+# Bare continue (not inside an if). Code after is unreachable.
+out = []
+for i in range(3):
+    out.append(('before', i))
+    continue
+    out.append(('unreachable', i))
+print('bare continue for:', out)
+
+
+out2 = []
+n = 0
+while n < 4:
+    n += 1
+    out2.append(n)
+    continue
+    out2.append(('unreachable', n))
+print('bare continue while:', out2)
+
+
+# Bare continue only skips the inner-loop iteration; outer keeps going.
+out3 = []
+for i in range(3):
+    for j in range(2):
+        out3.append(('inner', i, j))
+        continue
+        out3.append(('inner-unreachable',))
+    out3.append(('outer-after', i))
+print('nested bare continue:', out3)
