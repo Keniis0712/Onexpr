@@ -12,6 +12,8 @@ class Frame:
     in_async_def: bool = False
     temp_var_num: Optional[int] = None
     loops: list[str] = dataclasses.field(default_factory=list)
+    func_helper_var: Optional[str] = None
+    reserved_names: Optional[set] = None  # only the top frame owns this
 
     def get_temp_var_num(self) -> int:
         if self.temp_var_num is None:
@@ -19,10 +21,19 @@ class Frame:
 
         return self.temp_var_num
 
+    def get_reserved_names(self) -> set:
+        if self.reserved_names is not None:
+            return self.reserved_names
+        return self.prev.get_reserved_names()
+
     def get_temp_var(self):
-        temp_var_num = self.get_temp_var_num()
-        self.temp_var_num = self.temp_var_num + 1
-        return f"temp_{temp_var_num}"
+        reserved = self.get_reserved_names()
+        while True:
+            temp_var_num = self.get_temp_var_num()
+            self.temp_var_num = self.temp_var_num + 1
+            name = f"temp_{temp_var_num}"
+            if name not in reserved:
+                return name
 
     def enter_loop(self):
         self.loops.append(self.get_temp_var())
@@ -96,6 +107,21 @@ class NodePresenceDetector(ast.NodeVisitor):
         return self.presence
 
 
+def collect_user_names(tree: ast.AST) -> set:
+    """Collect every identifier already used in the source tree, so that
+    generated temp_N names won't collide with user code (e.g. a user
+    function parameter that happens to be called `temp_1`)."""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+    return names
+
+
 def code2tree(code: str) -> ast.stmt:
     tree = ast.parse(code)
     return tree.body[0]
@@ -103,7 +129,7 @@ def code2tree(code: str) -> ast.stmt:
 
 def add_deco(name: str, decorators: list[ast.expr], func: _ast.expr) -> ast.expr:
     node = func
-    for decorator in decorators:
+    for decorator in reversed(decorators):
         node = ast.Call(
             func=decorator,
             args=[node],
@@ -114,18 +140,48 @@ def add_deco(name: str, decorators: list[ast.expr], func: _ast.expr) -> ast.expr
 
 def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
     temp_func_var = sub_frame.get_temp_var()
-    body = stmt.body
-    if not isinstance(body[-1], ast.Return):
-        body.append(ast.Return(ast.Constant(value=None)))
+    helper_var = sub_frame.func_helper_var
+    body_or = parse_stmts(stmt.body, frame=sub_frame)
+    lambda_body = ast.Subscript(
+        value=ast.Tuple(
+            elts=[
+                ast.BoolOp(
+                    op=ast.Or(),
+                    values=[
+                        ast.BoolOp(
+                            op=ast.And(),
+                            values=[
+                                ast.NamedExpr(
+                                    target=ast.Name(id=helper_var, ctx=ast.Store()),
+                                    value=ast.Call(
+                                        func=ast.Name(id=func_helper_name, ctx=ast.Load()),
+                                        args=[],
+                                        keywords=[],
+                                    ),
+                                ),
+                                ast.Constant(value=False),
+                            ],
+                        ),
+                        body_or,
+                    ],
+                ),
+                ast.Attribute(
+                    value=ast.Name(id=helper_var, ctx=ast.Load()),
+                    attr='value',
+                    ctx=ast.Load(),
+                ),
+            ],
+            ctx=ast.Load(),
+        ),
+        slice=ast.Constant(value=1),
+        ctx=ast.Load(),
+    )
     return [
         ast.Assign(
             targets=[ast.Name(id=temp_func_var, ctx=ast.Store())],
             value=ast.Lambda(
                 args=stmt.args,
-                body=ast.Subscript(
-                    value=parse_stmts(body, frame=sub_frame),
-                    slice=ast.Constant(value=0)
-                )
+                body=lambda_body,
             )
         ),
         ast.Assign(
@@ -150,6 +206,7 @@ def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
 
 def parse_function_def(stmt: ast.FunctionDef, frame: Frame) -> list[_ast.AST]:
     sub_frame = Frame(prev=frame, nonlocal_vars=[], global_vars=[])
+    sub_frame.func_helper_var = sub_frame.get_temp_var()
     return gen_func(stmt, sub_frame)
 
 
@@ -179,6 +236,8 @@ def parse_async_function_def(stmt: ast.AsyncFunctionDef, frame: Frame) -> list[_
 
 def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
     sub_frame = Frame(prev=frame, nonlocal_vars=[], global_vars=[])
+    sub_frame.func_helper_var = sub_frame.get_temp_var()
+    helper_var = sub_frame.func_helper_var
     cls_body = stmt.body
     cls_body.append(
         ast.Return(
@@ -195,6 +254,42 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
             metaclass = kwd.value
             break
 
+    body_or = parse_stmts(cls_body, frame=sub_frame)
+    cls_lambda_body = ast.Subscript(
+        value=ast.Tuple(
+            elts=[
+                ast.BoolOp(
+                    op=ast.Or(),
+                    values=[
+                        ast.BoolOp(
+                            op=ast.And(),
+                            values=[
+                                ast.NamedExpr(
+                                    target=ast.Name(id=helper_var, ctx=ast.Store()),
+                                    value=ast.Call(
+                                        func=ast.Name(id=func_helper_name, ctx=ast.Load()),
+                                        args=[],
+                                        keywords=[],
+                                    ),
+                                ),
+                                ast.Constant(value=False),
+                            ],
+                        ),
+                        body_or,
+                    ],
+                ),
+                ast.Attribute(
+                    value=ast.Name(id=helper_var, ctx=ast.Load()),
+                    attr='value',
+                    ctx=ast.Load(),
+                ),
+            ],
+            ctx=ast.Load(),
+        ),
+        slice=ast.Constant(value=1),
+        ctx=ast.Load(),
+    )
+
     return [
         ast.Assign(
             targets=[ast.Name(id=stmt.name, ctx=ast.Store())],
@@ -206,24 +301,21 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
                     args=[
                         ast.Constant(stmt.name),
                         ast.Tuple(elts=stmt.bases, ctx=ast.Load()),
-                        ast.Subscript(
-                            value=ast.Call(
-                                func=ast.Lambda(
-                                    args=ast.arguments(
-                                        posonlyargs=[],
-                                        args=[],
-                                        vararg=None,
-                                        kwonlyargs=[],
-                                        kw_defaults=[],
-                                        defaults=[],
-                                    ),
-                                    body=parse_stmts(cls_body, frame=sub_frame),
+                        ast.Call(
+                            func=ast.Lambda(
+                                args=ast.arguments(
+                                    posonlyargs=[],
+                                    args=[],
+                                    vararg=None,
+                                    kwonlyargs=[],
+                                    kw_defaults=[],
+                                    defaults=[],
                                 ),
-                                args=[],
-                                keywords=[],
+                                body=cls_lambda_body,
                             ),
-                            slice=ast.Constant(value=0)
-                        )
+                            args=[],
+                            keywords=[],
+                        ),
                     ],
                     keywords=[],
                 )
@@ -235,7 +327,15 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
 def parse_return(stmt: ast.Return, frame: Frame) -> list[_ast.AST]:
     value = stmt.value if stmt.value is not None else ast.Constant(value=None)
     return [
-        ast.Tuple(elts=[value, ast.Constant(value=True)], ctx=ast.Load()),
+        ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id=frame.func_helper_var, ctx=ast.Load()),
+                attr='do_return',
+                ctx=ast.Load(),
+            ),
+            args=[value],
+            keywords=[],
+        )
     ]
 
 
@@ -278,12 +378,18 @@ def parse_assign(stmt: ast.Assign, frame: Frame) -> list[_ast.AST]:
 
     if isinstance(target, (ast.List, ast.Tuple)):
         # This is look like "a, b = c"
-        # We first copy the value to temp var
+        # First materialize the RHS as a list so subscripting works for any
+        # iterable (including iterators and instances with __iter__ but no
+        # __getitem__).
         temp_var = frame.get_temp_var()
         assigns = [
             ast.Assign(
                 targets=[ast.Name(id=temp_var, ctx=ast.Store())],
-                value=stmt.value,
+                value=ast.Call(
+                    func=ast.Name(id='list', ctx=ast.Load()),
+                    args=[stmt.value],
+                    keywords=[],
+                ),
             )
         ]
         # Then get each element from the temp var
@@ -303,6 +409,7 @@ def parse_assign(stmt: ast.Assign, frame: Frame) -> list[_ast.AST]:
 
         if before_star is not None:
             after_star = len(names) - before_star - 1
+            upper = ast.Constant(-after_star) if after_star > 0 else ast.Constant(value=None)
             assigns.append(
                 ast.Assign(
                     targets=[ast.Name(id=starred_name, ctx=ast.Store())],
@@ -310,7 +417,7 @@ def parse_assign(stmt: ast.Assign, frame: Frame) -> list[_ast.AST]:
                         value=ast.Name(id=temp_var, ctx=ast.Load()),
                         slice=ast.Slice(
                             lower=ast.Constant(before_star),
-                            upper=ast.Constant(-after_star),
+                            upper=upper,
                             col_offset=0,
                             end_col_offset=None,
                             end_lineno=None,
@@ -341,23 +448,33 @@ def parse_assign(stmt: ast.Assign, frame: Frame) -> list[_ast.AST]:
 
     if isinstance(target, (ast.Subscript, ast.Attribute)):
         if isinstance(target, ast.Subscript):
-            attr = '__setitem__'
-            pos = target.slice
-        else:
-            attr = '__setattr__'
-            pos = ast.Constant(target.attr)
-        # Use func to change the value
+            return [
+                ast.Expr(
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=target.value,
+                            attr='__setitem__',
+                            ctx=ast.Load(),
+                        ),
+                        args=[
+                            target.slice,
+                            stmt.value,
+                        ],
+                        keywords=[],
+                    )
+                )
+            ]
+        # Attribute assignment: use builtin setattr() so it works on both
+        # instances and class objects (cls.__setattr__('a', v) fails because
+        # __setattr__ on a class is a metaclass method that needs 3 args).
         return [
             ast.Expr(
                 value=ast.Call(
-                    func=ast.Attribute(
-                        value=target.value,
-                        attr=attr,
-                        ctx=ast.Load(),
-                    ),
+                    func=ast.Name(id='setattr', ctx=ast.Load()),
                     args=[
-                        pos,
-                        stmt.value
+                        target.value,
+                        ast.Constant(target.attr),
+                        stmt.value,
                     ],
                     keywords=[],
                 )
@@ -404,7 +521,10 @@ def parse_for(stmt: ast.For, frame: Frame) -> list[_ast.AST]:
             targets=[ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Store())],
             value=ast.Call(
                 func=ast.Name(id=for_helper_name, ctx=ast.Load()),
-                args=[stmt.iter],
+                args=[
+                    stmt.iter,
+                    ast.Name(id=frame.func_helper_var, ctx=ast.Load()),
+                ],
                 keywords=[],
             )
         ),
@@ -426,19 +546,46 @@ def parse_for(stmt: ast.For, frame: Frame) -> list[_ast.AST]:
         stmts.append(
             add_orelse(stmt.orelse, frame)
         )
+    stmts.append(make_return_propagator(frame))
     frame.exit_loop()
     return stmts
 
 
+def make_return_propagator(frame: Frame) -> ast.expr:
+    """If the current frame returned inside the loop body, surface the
+    return signal to the enclosing Or chain so it short-circuits."""
+    helper = ast.Name(id=frame.func_helper_var, ctx=ast.Load())
+    return ast.BoolOp(
+        op=ast.And(),
+        values=[
+            ast.Attribute(value=helper, attr='returned', ctx=ast.Load()),
+            ast.Constant(value=True),
+        ],
+    )
+
+
 def add_orelse(orelse, frame):
     return ast.If(
-        test=ast.UnaryOp(
-            op=ast.Not(),
-            operand=ast.Attribute(
-                value=ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load()),
-                attr='stopped',
-                ctx=ast.Load(),
-            )
+        test=ast.BoolOp(
+            op=ast.And(),
+            values=[
+                ast.UnaryOp(
+                    op=ast.Not(),
+                    operand=ast.Attribute(
+                        value=ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load()),
+                        attr='stopped',
+                        ctx=ast.Load(),
+                    )
+                ),
+                ast.UnaryOp(
+                    op=ast.Not(),
+                    operand=ast.Attribute(
+                        value=ast.Name(id=frame.func_helper_var, ctx=ast.Load()),
+                        attr='returned',
+                        ctx=ast.Load(),
+                    )
+                ),
+            ],
         ),
         body=orelse,
         orelse=[],
@@ -469,7 +616,7 @@ def parse_while(stmt: ast.While, frame: Frame) -> list[_ast.AST]:
             targets=[ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load())],
             value=ast.Call(
                 func=ast.Name(id=while_helper_name, ctx=ast.Load()),
-                args=[],
+                args=[ast.Name(id=frame.func_helper_var, ctx=ast.Load())],
                 keywords=[],
             )
         ),
@@ -491,6 +638,7 @@ def parse_while(stmt: ast.While, frame: Frame) -> list[_ast.AST]:
         stmts.append(
             add_orelse(stmt.orelse, frame)
         )
+    stmts.append(make_return_propagator(frame))
     frame.exit_loop()
     return stmts
 
@@ -739,14 +887,17 @@ name2func: dict[str, Callable] = {
 for_helper_name = '_ForHelper'
 for_helper_code = f"""
 class {for_helper_name}:
-    def __init__(self, iterable):
+    def __init__(self, iterable, func_helper):
         self.iterable = iter(iterable)
         self.stopped = False
+        self.func_helper = func_helper
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        if self.func_helper.returned:
+            self.stopped = True
         if self.stopped:
             raise StopIteration
         return next(self.iterable)
@@ -760,14 +911,17 @@ for_helper = code2tree(for_helper_code)
 while_helper_name = '_WhileHelper'
 while_helper_code = f"""
 class {while_helper_name}:
-    def __init__(self):
+    def __init__(self, func_helper):
         self.stopped = False
         self.ended = False
+        self.func_helper = func_helper
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        if self.func_helper.returned:
+            self.stopped = True
         if self.stopped or self.ended:
             raise StopIteration
         return None
@@ -783,6 +937,20 @@ class {while_helper_name}:
         return True
 """
 while_helper = code2tree(while_helper_code)
+
+func_helper_name = '_FuncHelper'
+func_helper_code = f"""
+class {func_helper_name}:
+    def __init__(self):
+        self.returned = False
+        self.value = None
+
+    def do_return(self, v):
+        self.returned = True
+        self.value = v
+        return True
+"""
+func_helper = code2tree(func_helper_code)
 
 LIB_TYPES = '_types'
 LIB_COLLECTIONS = '_collections'
@@ -826,16 +994,39 @@ def parse_stmts(stmts: list[ast.stmt], frame: Frame) -> _ast.BoolOp:
     )
 
 
-def add_helper(tree: ast.AST):
+def add_helper(tree: ast.AST, top_func_helper_var: str):
     # Get all used node types
     detector = NodePresenceDetector()
     detector.visit(tree)
 
-    to_insert = []
+    # Collect helper class source as a single exec'able blob, so the helper
+    # classes themselves do not get rewritten by parse_class_def. (If they
+    # did, _FuncHelper's class body would reference _FuncHelper before
+    # _FuncHelper is bound — chicken-and-egg.)
+    helper_sources = [func_helper_code]
     if ast.For in detector.presence:
-        to_insert.append(for_helper)
+        helper_sources.append(for_helper_code)
     if ast.While in detector.presence:
-        to_insert.append(while_helper)
+        helper_sources.append(while_helper_code)
+    helper_blob = '\n'.join(helper_sources)
+
+    to_insert = [
+        ast.Expr(
+            value=ast.Call(
+                func=ast.Name(id='exec', ctx=ast.Load()),
+                args=[
+                    ast.Constant(value=helper_blob),
+                    ast.Call(
+                        func=ast.Name(id='globals', ctx=ast.Load()),
+                        args=[],
+                        keywords=[],
+                    ),
+                ],
+                keywords=[],
+            )
+        )
+    ]
+
     if ast.AsyncFunctionDef in detector.presence:
         to_insert.append(ast.Import(
             names=[
@@ -881,6 +1072,17 @@ def add_helper(tree: ast.AST):
             )
         )
 
+    to_insert.append(
+        ast.Assign(
+            targets=[ast.Name(id=top_func_helper_var, ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Name(id=func_helper_name, ctx=ast.Load()),
+                args=[],
+                keywords=[],
+            ),
+        )
+    )
+
     tree.body = to_insert + tree.body
 
 
@@ -888,12 +1090,14 @@ def parse_root(tree: ast.Module) -> ast.Module:
     # Init the top frame
     top_frame = Frame(None, [], [])
     top_frame.temp_var_num = 0
+    top_frame.reserved_names = collect_user_names(tree)
 
     # Transform "super()" to "super(cls, self)"
     super_trans = SuperTransformer()
     tree = super_trans.visit(tree)
 
-    add_helper(tree)
+    top_frame.func_helper_var = top_frame.get_temp_var()
+    add_helper(tree, top_frame.func_helper_var)
 
     expr = parse_stmts(tree.body, top_frame)
     return ast.Module(
