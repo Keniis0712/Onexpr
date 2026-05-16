@@ -305,26 +305,18 @@ def parse_delete(stmt: ast.Delete, frame: Frame) -> list[_ast.AST]:
                 )
             ))
         elif isinstance(target, ast.Name):
-            # del x: best-effort. Drop from globals() so module-level usage
-            # works. For names that live in a lambda's locals (function or
-            # class body) this is a silent no-op — the original `del`
-            # semantics around local NameError can't be reproduced inside
-            # an expression.
+            # del x: best-effort. _del_local handles both the module-
+            # level case (deletes from globals) and the function/lambda
+            # local case (sets the slot to None on Python 3.13+ via the
+            # PEP 667 f_locals proxy; on earlier versions the local
+            # case is a silent no-op). Either way, the original
+            # NameError-on-subsequent-access semantics can't be
+            # reproduced — once a slot exists in fast locals there's
+            # no Python-level way to unbind it.
             out.append(ast.Expr(
                 value=ast.Call(
-                    func=ast.Attribute(
-                        value=ast.Call(
-                            func=ast.Name(id='globals', ctx=ast.Load()),
-                            args=[],
-                            keywords=[],
-                        ),
-                        attr='pop',
-                        ctx=ast.Load(),
-                    ),
-                    args=[
-                        ast.Constant(value=target.id),
-                        ast.Constant(value=None),
-                    ],
+                    func=ast.Name(id='_del_local', ctx=ast.Load()),
+                    args=[ast.Constant(value=target.id)],
                     keywords=[],
                 )
             ))

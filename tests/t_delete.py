@@ -95,3 +95,26 @@ print(g)
 temp = 'temporary'
 del temp
 print('temp' in globals())
+
+
+def del_releases_local_object():
+    # `del x` on a function local can't make subsequent access raise
+    # NameError under onexpr (CPython doesn't allow Python-level
+    # unbinding of fast locals). Best-effort behavior: the slot becomes
+    # None and the original object reference is dropped so it can be
+    # GC'd. Requires Python 3.13+ for the local case (PEP 667 made
+    # f_locals on optimized frames write-through).
+    import weakref
+    import gc
+
+    class Big:
+        pass
+
+    obj = Big()
+    ref = weakref.ref(obj)
+    del obj
+    gc.collect()
+    return ref() is None
+
+
+print(del_releases_local_object())

@@ -51,6 +51,11 @@ def _get_core_helper_body() -> list:
         ):
             _mark_legacy_return(stmt)
             kept.append(stmt)
+        elif isinstance(stmt, ast.FunctionDef):
+            # Module-level helper functions (e.g. _del_local). These
+            # appear after the helper classes, so they CAN reference
+            # _FuncHelper through the regular transform path.
+            kept.append(stmt)
     return kept
 
 
@@ -73,7 +78,9 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
 
     # Pull in the three core helper classes; each is annotated for the
     # legacy return convention so transforming them doesn't reference
-    # _FuncHelper before it's bound.
+    # _FuncHelper before it's bound. Module-level helper functions
+    # (e.g. _del_local) are pulled in on demand based on what the user
+    # code uses.
     core_body = _get_core_helper_body()
     core_by_name = {s.name: s for s in core_body}
 
@@ -82,6 +89,8 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
         to_insert.append(core_by_name[for_helper_name])
     if needs_while:
         to_insert.append(core_by_name[while_helper_name])
+    if ast.Delete in detector.presence and '_del_local' in core_by_name:
+        to_insert.append(core_by_name['_del_local'])
 
     if ast.AsyncFunctionDef in detector.presence:
         to_insert.append(ast.Import(

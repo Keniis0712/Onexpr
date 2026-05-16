@@ -82,3 +82,33 @@ class _WhileHelper:
             return False
         self.ended = True
         return True
+
+
+# Best-effort `del x` for an optimized (function/lambda) frame.
+#
+# CPython does not expose any way to *unbind* a fast local from Python
+# code — PEP 667 explicitly disallows del/pop on the f_locals proxy of
+# an optimized frame. The closest we can do is set the slot to None,
+# which (a) drops the original object reference so it can be GC'd, and
+# (b) makes subsequent reads return None instead of the original value.
+# `del x` does NOT raise NameError on later access, which is a known
+# divergence from CPython.
+#
+# Requires Python 3.13+ for the function-local case (PEP 667 made
+# f_locals on optimized frames a write-through proxy). On earlier
+# versions the assignment is a silent no-op.
+def _del_local(name):
+    import sys
+    frame = sys._getframe(1)
+    if frame.f_locals is frame.f_globals:
+        # Module-level frame — locals IS globals. Real removal is fine.
+        frame.f_globals.pop(name, None)
+        return None
+    # Function/lambda frame. PEP 667 (Python 3.13+) makes assignment to
+    # f_locals on optimized frames write through to the actual fast
+    # local slot; setting the slot to None drops the original object
+    # reference (so it can be GC'd) and any subsequent read returns
+    # None. Earlier Python versions: the assignment is a silent no-op.
+    frame.f_locals[name] = None
+    return None
+

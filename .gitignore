@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
 tests/output/
+tests/temp/
 .claude/
 CLAUDE.md
+.venv/

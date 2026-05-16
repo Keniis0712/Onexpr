@@ -1,6 +1,7 @@
 import ast
 import glob
 import subprocess
+import sys
 import unittest
 
 import trans
@@ -8,7 +9,7 @@ import trans
 
 class TestCase(unittest.TestCase):
     def run_func(self, file):
-        process = subprocess.Popen(["python", file], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        process = subprocess.Popen([sys.executable, file], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
             output, _ = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
