@@ -152,9 +152,33 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
         frame.legacy_return or getattr(stmt, '_use_legacy_return', False)
     )
     if not sub_frame.legacy_return:
-        sub_frame.func_helper_var = sub_frame.get_temp_var()
+        # If the nonlocal pass marked this class body as the owner of
+        # one or more boxed names (try-clause assignments inside the
+        # class body), reuse that exact helper var name so the rewritten
+        # Attribute(Name('temp_N'), '_b_x') references stay correct.
+        box_var = getattr(stmt, '_box_helper_var', None)
+        sub_frame.func_helper_var = box_var if box_var is not None else sub_frame.get_temp_var()
     helper_var = sub_frame.func_helper_var
     cls_body = stmt.body
+
+    # If the nonlocal pass boxed any names assigned inside try clauses
+    # of this class body, those writes went to helper._b_<name>. The
+    # class namespace is built from `locals()`, so we reverse-copy each
+    # boxed name back into a regular local right before the locals()
+    # call so the namespace ends up with the right keys.
+    class_boxed_names = getattr(stmt, '_class_boxed_names', None) or set()
+    for name in sorted(class_boxed_names):
+        cls_body.append(
+            ast.Assign(
+                targets=[ast.Name(id=name, ctx=ast.Store())],
+                value=ast.Attribute(
+                    value=ast.Name(id=helper_var, ctx=ast.Load()),
+                    attr='_b_' + name,
+                    ctx=ast.Load(),
+                ),
+            )
+        )
+
     cls_body.append(
         ast.Return(
             value=ast.Call(
@@ -905,6 +929,51 @@ def parse_try(stmt: ast.Try, frame: Frame) -> list[_ast.AST]:
                     args=[finally_lambda],
                     keywords=[],
                 ),
+            )
+        )
+        # Chain context: if both `finally` and the pre-finally body
+        # produced exceptions, Python sets e_finally.__context__ to
+        # e_pending so the user sees "during handling of <e_pending>,
+        # another exception occurred". The generator-throw trick
+        # bypasses CPython's automatic chaining, so re-create it.
+        stmts.append(
+            ast.Expr(
+                value=ast.IfExp(
+                    test=ast.BoolOp(
+                        op=ast.And(),
+                        values=[
+                            ast.Compare(
+                                left=ast.Name(id=e_finally_var, ctx=ast.Load()),
+                                ops=[ast.IsNot()],
+                                comparators=[ast.Constant(value=None)],
+                            ),
+                            ast.Compare(
+                                left=ast.Name(id=e_pending, ctx=ast.Load()),
+                                ops=[ast.IsNot()],
+                                comparators=[ast.Constant(value=None)],
+                            ),
+                            ast.Compare(
+                                left=ast.Attribute(
+                                    value=ast.Name(id=e_finally_var, ctx=ast.Load()),
+                                    attr='__context__',
+                                    ctx=ast.Load(),
+                                ),
+                                ops=[ast.Is()],
+                                comparators=[ast.Constant(value=None)],
+                            ),
+                        ],
+                    ),
+                    body=ast.Call(
+                        func=ast.Name(id='setattr', ctx=ast.Load()),
+                        args=[
+                            ast.Name(id=e_finally_var, ctx=ast.Load()),
+                            ast.Constant(value='__context__'),
+                            ast.Name(id=e_pending, ctx=ast.Load()),
+                        ],
+                        keywords=[],
+                    ),
+                    orelse=ast.Constant(value=None),
+                )
             )
         )
 

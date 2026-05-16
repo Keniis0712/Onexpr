@@ -361,6 +361,20 @@ def _resolve_owners(tree) -> dict:
             for child in ast.iter_child_nodes(node):
                 visit(child, new_stack)
         elif isinstance(node, ast.ClassDef):
+            # Class body has the same try-clause-lambda problem as a
+            # function body — assignments inside the try clause are
+            # otherwise lost when the per-clause lambda returns. Box
+            # them on the class body's helper. parse_class_def will
+            # emit reverse-copies before `return locals()` so the
+            # class namespace ends up with the right names.
+            class_boxed = set()
+            for name in _collect_try_clause_assigns(node):
+                class_boxed.add(name)
+            if class_boxed:
+                boxed[id(node)] = class_boxed
+                # Stash on the node so parse_class_def can emit
+                # the reverse-copies.
+                node._class_boxed_names = class_boxed
             for child in ast.iter_child_nodes(node):
                 visit(child, func_stack)
         else:
@@ -456,13 +470,27 @@ def _rewrite(tree, boxed, helper_name_for, module_boxed=frozenset(), module_help
         if isinstance(node, ast.ClassDef):
             # Class body is a scope but is invisible to nested function
             # nonlocal-resolution. For boxed-name lookup we treat it as
-            # transparent: a Name reference in a class body resolves up
-            # through the enclosing functions just like a function body.
+            # transparent in the parent direction: a Name reference in
+            # a class body resolves up through the enclosing functions
+            # just like a function body. But the class itself can also
+            # be an owner — try-clause assignments inside the class
+            # body get boxed on the class's own helper (so per-clause
+            # lambdas can write through to a shared container, and
+            # parse_class_def reverse-copies them into locals before
+            # `return locals()`).
+            class_boxset = boxed.get(id(node), set())
+            class_helper = helper_name_for(node) if class_boxset else None
+
+            def class_lookup(name, _parent=lookup, _box=class_boxset, _h=class_helper):
+                if name in _box:
+                    return (_h, name)
+                return _parent(name)
+
             node.decorator_list = [visit(d, lookup) for d in node.decorator_list]
             node.bases = [visit(b, lookup) for b in node.bases]
             for kw in node.keywords:
                 kw.value = visit(kw.value, lookup)
-            node.body = [visit(s, lookup) for s in node.body]
+            node.body = [visit(s, class_lookup) for s in node.body]
             return node
 
         if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):

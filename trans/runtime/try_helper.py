@@ -150,11 +150,22 @@ class _TryHelper:
             if not terminated and loop_helper is not None:
                 terminated = loop_helper.stopped
             if not terminated and else_fn is not None:
-                return _TryHelper.guarded(else_fn)
+                e_else = _TryHelper.guarded(else_fn)
+                # `else` ran with no in-flight exception, no context to chain.
+                return e_else
             return None
         # body raised
         for exc_types, handler in handlers:
             if exc_types is None or isinstance(e1, exc_types):
-                return _TryHelper.guarded(lambda: handler(e1))
+                e2 = _TryHelper.guarded(lambda: handler(e1))
+                # If the handler itself raised, Python sets the new
+                # exception's __context__ to the one it was handling.
+                # CPython does this in RAISE_VARARGS by reading the
+                # current exception state; our generator-throw trick
+                # runs outside of that exception state, so we re-create
+                # the chain explicitly.
+                if e2 is not None and e2.__context__ is None and e2 is not e1:
+                    e2.__context__ = e1
+                return e2
         # unhandled — surface the body exception
         return e1
