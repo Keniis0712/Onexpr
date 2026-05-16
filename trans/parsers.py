@@ -922,7 +922,8 @@ def parse_async_with(stmt: ast.AsyncWith, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_match(stmt: ast.Match, frame: Frame) -> list[_ast.AST]:
-    pass
+    from .match_patterns import compile_match
+    return compile_match(stmt, frame)
 
 
 def parse_raise(stmt: ast.Raise, frame: Frame) -> list[_ast.AST]:
