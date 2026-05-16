@@ -20,6 +20,9 @@ class Frame:
     # Limitation of legacy mode: `return` inside a loop doesn't escape
     # the loop. Helper methods don't do that, so they fit fine.
     legacy_return: bool = False
+    # Set when this frame is a class body (so parse_ann_assign knows to
+    # write to __annotations__).
+    is_class_body: bool = False
 
     def get_temp_var_num(self) -> int:
         if self.temp_var_num is None:

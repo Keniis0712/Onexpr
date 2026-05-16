@@ -34,20 +34,38 @@ def slice_to_callable(key: ast.expr) -> ast.expr:
     return key
 
 
-def strip_arg_annotations(args: ast.arguments) -> None:
-    """Lambda doesn't accept annotated parameters; strip them in place."""
-    for group in (args.posonlyargs, args.args, args.kwonlyargs):
+def strip_arg_annotations(args: ast.arguments) -> dict:
+    """Lambda doesn't accept annotated parameters; strip them in
+    place. Returns a {param_name: annotation_expr} dict so the caller
+    can re-attach them to the resulting function's __annotations__.
+    The dict preserves Python's parameter order: posonly, args, vararg,
+    kwonly, kwarg."""
+    annotations = {}
+    for group in (args.posonlyargs, args.args):
         for a in group:
-            a.annotation = None
+            if a.annotation is not None:
+                annotations[a.arg] = a.annotation
+                a.annotation = None
     if args.vararg is not None:
-        args.vararg.annotation = None
+        if args.vararg.annotation is not None:
+            annotations[args.vararg.arg] = args.vararg.annotation
+            args.vararg.annotation = None
+    for a in args.kwonlyargs:
+        if a.annotation is not None:
+            annotations[a.arg] = a.annotation
+            a.annotation = None
     if args.kwarg is not None:
-        args.kwarg.annotation = None
+        if args.kwarg.annotation is not None:
+            annotations[args.kwarg.arg] = args.kwarg.annotation
+            args.kwarg.annotation = None
+    return annotations
 
 
 def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
     temp_func_var = sub_frame.get_temp_var()
-    strip_arg_annotations(stmt.args)
+    arg_annotations = strip_arg_annotations(stmt.args)
+    return_annotation = stmt.returns
+    stmt.returns = None
     if sub_frame.legacy_return:
         # Legacy mode: append `return None` to the body so the body's Or
         # chain ends with a (value, True) tuple, then take [0] in the
@@ -98,7 +116,8 @@ def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
             slice=ast.Constant(value=1),
             ctx=ast.Load(),
         )
-    return [
+
+    out = [
         ast.Assign(
             targets=[ast.Name(id=temp_func_var, ctx=ast.Store())],
             value=ast.Lambda(
@@ -115,6 +134,31 @@ def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
             ],
             value=ast.Constant(value=stmt.name)
         ),
+    ]
+    # Reconstruct func.__annotations__ from the parameter annotations
+    # we stripped + the return annotation so introspection (e.g.
+    # typing.get_type_hints, dataclasses, pydantic) sees them.
+    if arg_annotations or return_annotation is not None:
+        ann_keys = []
+        ann_values = []
+        for k, v in arg_annotations.items():
+            ann_keys.append(ast.Constant(value=k))
+            ann_values.append(v)
+        if return_annotation is not None:
+            ann_keys.append(ast.Constant(value='return'))
+            ann_values.append(return_annotation)
+        out.append(
+            ast.Assign(
+                targets=[
+                    ast.Attribute(
+                        value=ast.Name(id=temp_func_var, ctx=ast.Load()),
+                        attr='__annotations__',
+                    )
+                ],
+                value=ast.Dict(keys=ann_keys, values=ann_values),
+            )
+        )
+    out.append(
         ast.Assign(
             targets=[ast.Name(id=stmt.name, ctx=ast.Store())],
             value=add_deco(
@@ -123,7 +167,8 @@ def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
                 ast.Name(id=temp_func_var, ctx=ast.Load()),
             )
         )
-    ]
+    )
+    return out
 
 
 def parse_function_def(stmt: ast.FunctionDef, frame: Frame) -> list[_ast.AST]:
@@ -266,6 +311,7 @@ def _collect_class_body_names(body: list) -> list:
 
 def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
     sub_frame = Frame(prev=frame, nonlocal_vars=[], global_vars=[])
+    sub_frame.is_class_body = True
     sub_frame.legacy_return = (
         frame.legacy_return or getattr(stmt, '_use_legacy_return', False)
     )
@@ -278,6 +324,17 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
         sub_frame.func_helper_var = box_var if box_var is not None else sub_frame.get_temp_var()
     helper_var = sub_frame.func_helper_var
     cls_body = stmt.body
+
+    # Class body needs an __annotations__ dict so parse_ann_assign can
+    # write to it. Prepend `__annotations__ = {}` at the top of the
+    # body so it's available before any annotated assignments.
+    cls_body.insert(
+        0,
+        ast.Assign(
+            targets=[ast.Name(id='__annotations__', ctx=ast.Store())],
+            value=ast.Dict(keys=[], values=[]),
+        )
+    )
 
     # If the nonlocal pass boxed any names assigned inside try clauses
     # of this class body, those writes went to helper._b_<name>. We
@@ -304,6 +361,10 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
     # those into a metaclass like Enum's would either trip its name
     # validation or pollute the resulting class with garbage.
     user_names = _collect_class_body_names(cls_body)
+    # Always include __annotations__ in the returned dict so the class
+    # gets it even if the user didn't write any annotated assignments.
+    if '__annotations__' not in user_names:
+        user_names.append('__annotations__')
 
     # Replace the trailing Return(locals()) with Return({name: name, ...}).
     cls_body.append(
@@ -687,7 +748,50 @@ def parse_assign(stmt: ast.Assign, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_type_alias(stmt: ast.TypeAlias, frame: Frame) -> list[_ast.AST]:
-    pass
+    # PEP 695 `type X = expr` (and `type X[T, ...] = expr`).
+    # We collapse it to a plain `X = expr` assignment. This loses the
+    # lazy-evaluation semantics of typing.TypeAliasType (the value
+    # expression normally isn't evaluated until X.__value__ is read)
+    # and it ignores the type parameters — at runtime that mostly
+    # only matters for typing-introspection tools, not for ordinary
+    # code that just wants `Vector = list[float]`-style aliasing.
+    #
+    # type params (e.g. T in `type Pair[T] = tuple[T, T]`) need to be
+    # in scope when expr is evaluated. We bind each one to a fresh
+    # TypeVar at the same statement level so the alias body can read
+    # them. typing.TypeVar at module level is the closest plain-Python
+    # match for PEP 695's TypeVar declaration.
+    stmts = []
+    for tp in stmt.type_params:
+        if isinstance(tp, ast.TypeVar):
+            stmts.append(
+                ast.Assign(
+                    targets=[ast.Name(id=tp.name, ctx=ast.Store())],
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Call(
+                                func=ast.Name(id='__import__', ctx=ast.Load()),
+                                args=[ast.Constant(value='typing')],
+                                keywords=[],
+                            ),
+                            attr='TypeVar',
+                            ctx=ast.Load(),
+                        ),
+                        args=[ast.Constant(value=tp.name)],
+                        keywords=[],
+                    ),
+                )
+            )
+        # ParamSpec / TypeVarTuple omitted for now — they're rare and
+        # parse_type_alias is mostly about getting `type X = ...` to
+        # not crash.
+    stmts.append(
+        ast.Assign(
+            targets=[stmt.name],
+            value=stmt.value,
+        )
+    )
+    return stmts
 
 
 def parse_aug_assign(stmt: ast.AugAssign, frame: Frame) -> list[_ast.AST]:
@@ -704,13 +808,42 @@ def parse_aug_assign(stmt: ast.AugAssign, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_ann_assign(stmt: ast.AnnAssign, frame: Frame) -> list[_ast.AST]:
+    # `x: int [= v]` at module level or in a class body writes to
+    # __annotations__. Inside a function body, the annotation is
+    # ignored at runtime (it's only for static checkers).
+    should_annotate = (
+        frame.prev is None  # module level
+        or frame.is_class_body
+    ) and isinstance(stmt.target, ast.Name)
+
+    out = []
+    if should_annotate:
+        # __annotations__['x'] = int
+        out.append(
+            ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id='__annotations__', ctx=ast.Load()),
+                        attr='__setitem__',
+                        ctx=ast.Load(),
+                    ),
+                    args=[
+                        ast.Constant(value=stmt.target.id),
+                        stmt.annotation,
+                    ],
+                    keywords=[],
+                )
+            )
+        )
     if stmt.value is None:
-        # `x: int` is a bare annotation. At runtime it's a no-op for the
-        # value (annotations land in __annotations__ but we ignore that).
-        return [ast.Constant(value=False)]
-    # `x: int = v` -> `x = v`. Drop the annotation; let parse_assign handle
-    # the rest (Name / Attribute / Subscript targets).
-    return [ast.Assign(targets=[stmt.target], value=stmt.value)]
+        # Bare annotation `x: int` with no value. If we wrote to
+        # __annotations__, that's all. Otherwise it's a no-op.
+        if not out:
+            out.append(ast.Constant(value=False))
+        return out
+    # `x: int = v` -> also do `x = v`.
+    out.append(ast.Assign(targets=[stmt.target], value=stmt.value))
+    return out
 
 
 def parse_for(stmt: ast.For, frame: Frame) -> list[_ast.AST]:
