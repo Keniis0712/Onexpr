@@ -1,130 +1,9 @@
 import _ast
 import ast
-import dataclasses
-from typing import Optional, Callable
+from typing import Callable
 
-
-@dataclasses.dataclass
-class Frame:
-    prev: Optional["Frame"]
-    nonlocal_vars: list[str]
-    global_vars: list[str]
-    in_async_def: bool = False
-    temp_var_num: Optional[int] = None
-    loops: list[str] = dataclasses.field(default_factory=list)
-    func_helper_var: Optional[str] = None
-    reserved_names: Optional[set] = None  # only the top frame owns this
-
-    def get_temp_var_num(self) -> int:
-        if self.temp_var_num is None:
-            self.temp_var_num = self.prev.get_temp_var_num()
-
-        return self.temp_var_num
-
-    def get_reserved_names(self) -> set:
-        if self.reserved_names is not None:
-            return self.reserved_names
-        return self.prev.get_reserved_names()
-
-    def get_temp_var(self):
-        reserved = self.get_reserved_names()
-        while True:
-            temp_var_num = self.get_temp_var_num()
-            self.temp_var_num = self.temp_var_num + 1
-            name = f"temp_{temp_var_num}"
-            if name not in reserved:
-                return name
-
-    def enter_loop(self):
-        self.loops.append(self.get_temp_var())
-
-    def get_cur_loop_var(self):
-        assert len(self.loops)
-        return self.loops[-1]
-
-    def exit_loop(self):
-        self.loops.pop()
-
-
-class SuperTransformer(ast.NodeTransformer):
-    def __init__(self):
-        self.class_stack = []
-        self.first_arg = None
-
-    def visit_ClassDef(self, node):
-        self.class_stack.append(node.name)
-        self.generic_visit(node)
-        self.class_stack.pop()
-        return node
-
-    def visit_FunctionDef(self, node):
-        self._set_first_arg(node)
-        self.generic_visit(node)
-        self.first_arg = None
-        return node
-
-    def visit_AsyncFunctionDef(self, node):
-        self._set_first_arg(node)
-        self.generic_visit(node)
-        self.first_arg = None
-        return node
-
-    def _set_first_arg(self, node):
-        if node.args.args:
-            self.first_arg = node.args.args[0].arg
-        else:
-            self.first_arg = None
-
-    def visit_Call(self, node):
-        if (isinstance(node.func, ast.Name)
-                and node.func.id == 'super'
-                and len(node.args) == 0):
-            if not self.class_stack:
-                raise RuntimeError("Cannot determine class context for super()")
-            if not self.first_arg:
-                raise RuntimeError("Cannot determine first argument name for super() call")
-            class_name = self.class_stack[-1]
-            node.args = [
-                ast.Name(id=class_name, ctx=ast.Load()),
-                ast.Name(id=self.first_arg, ctx=ast.Load())
-            ]
-        return self.generic_visit(node)
-
-
-class NodePresenceDetector(ast.NodeVisitor):
-    def __init__(self):
-        self.presence = {}
-
-    def visit(self, node):
-        node_type = type(node)
-        if node_type not in self.presence:
-            self.presence[node_type] = True
-        self.generic_visit(node)
-
-    def detect(self, tree):
-        self.presence.clear()
-        self.visit(tree)
-        return self.presence
-
-
-def collect_user_names(tree: ast.AST) -> set:
-    """Collect every identifier already used in the source tree, so that
-    generated temp_N names won't collide with user code (e.g. a user
-    function parameter that happens to be called `temp_1`)."""
-    names = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            names.add(node.id)
-        elif isinstance(node, ast.arg):
-            names.add(node.arg)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-    return names
-
-
-def code2tree(code: str) -> ast.stmt:
-    tree = ast.parse(code)
-    return tree.body[0]
+from .frame import Frame
+from .helpers import for_helper_name, while_helper_name, func_helper_name
 
 
 def add_deco(name: str, decorators: list[ast.expr], func: _ast.expr) -> ast.expr:
@@ -211,26 +90,6 @@ def parse_function_def(stmt: ast.FunctionDef, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_async_function_def(stmt: ast.AsyncFunctionDef, frame: Frame) -> list[_ast.AST]:
-    # sub_frame = Frame(prev=frame, nonlocal_vars=[], global_vars=[], in_async_def=True)
-    # stmt.decorator_list.append(
-    #     ast.Attribute(
-    #         value=ast.Name(id=LIB_TYPES, ctx=ast.Load()),
-    #         attr='coroutine'
-    #     )
-    # )
-    # stmts: list[_ast.AST] = gen_func(stmt, sub_frame)
-    # stmts.append(
-    #     ast.Expr(
-    #         ast.Call(
-    #             func=ast.Attribute(
-    #                 value=ast.Name(id=LIB_INSPECT, ctx=ast.Load()),
-    #                 attr='markcoroutinefunction'
-    #             ),
-    #             args=[ast.Name(id=stmt.name, ctx=ast.Load())],
-    #         )
-    #     )
-    # )
-    # return stmts
     return None
 
 
@@ -371,11 +230,6 @@ def parse_assign(stmt: ast.Assign, frame: Frame) -> list[_ast.AST]:
 
     target = stmt.targets[0]
 
-    # if not isinstance(target, ast.Name):
-    #     # This is look like "a, b = c" or "a[b] = c"
-    #     ...
-    #     return None
-
     if isinstance(target, (ast.List, ast.Tuple)):
         # This is look like "a, b = c"
         # First materialize the RHS as a list so subscripting works for any
@@ -434,7 +288,6 @@ def parse_assign(stmt: ast.Assign, frame: Frame) -> list[_ast.AST]:
                 # We already parsed it
                 parse_before_star = False
                 continue
-            # assert isinstance(name, ast.Name), f"{type(name)}"
             assigns.append(
                 ast.Assign(
                     targets=[name],
@@ -884,78 +737,6 @@ name2func: dict[str, Callable] = {
     "Continue": parse_continue,
 }
 
-for_helper_name = '_ForHelper'
-for_helper_code = f"""
-class {for_helper_name}:
-    def __init__(self, iterable, func_helper):
-        self.iterable = iter(iterable)
-        self.stopped = False
-        self.func_helper = func_helper
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.func_helper.returned:
-            self.stopped = True
-        if self.stopped:
-            raise StopIteration
-        return next(self.iterable)
-
-    def stop(self):
-        self.stopped = True
-        return True
-"""
-for_helper = code2tree(for_helper_code)
-
-while_helper_name = '_WhileHelper'
-while_helper_code = f"""
-class {while_helper_name}:
-    def __init__(self, func_helper):
-        self.stopped = False
-        self.ended = False
-        self.func_helper = func_helper
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.func_helper.returned:
-            self.stopped = True
-        if self.stopped or self.ended:
-            raise StopIteration
-        return None
-
-    def stop(self):
-        self.stopped = True
-        return True
-
-    def cond(self, condition):
-        if condition:
-            return False
-        self.ended = True
-        return True
-"""
-while_helper = code2tree(while_helper_code)
-
-func_helper_name = '_FuncHelper'
-func_helper_code = f"""
-class {func_helper_name}:
-    def __init__(self):
-        self.returned = False
-        self.value = None
-
-    def do_return(self, v):
-        self.returned = True
-        self.value = v
-        return True
-"""
-func_helper = code2tree(func_helper_code)
-
-LIB_TYPES = '_types'
-LIB_COLLECTIONS = '_collections'
-LIB_INSPECT = '_inspect'
-
 
 def parse_stmt(stmt: ast.stmt, frame: Frame) -> list[ast.expr]:
     exprs = [stmt]
@@ -991,120 +772,4 @@ def parse_stmts(stmts: list[ast.stmt], frame: Frame) -> _ast.BoolOp:
     return ast.BoolOp(
         op=ast.Or(),
         values=exprs
-    )
-
-
-def add_helper(tree: ast.AST, top_func_helper_var: str):
-    # Get all used node types
-    detector = NodePresenceDetector()
-    detector.visit(tree)
-
-    # Collect helper class source as a single exec'able blob, so the helper
-    # classes themselves do not get rewritten by parse_class_def. (If they
-    # did, _FuncHelper's class body would reference _FuncHelper before
-    # _FuncHelper is bound — chicken-and-egg.)
-    helper_sources = [func_helper_code]
-    if ast.For in detector.presence:
-        helper_sources.append(for_helper_code)
-    if ast.While in detector.presence:
-        helper_sources.append(while_helper_code)
-    helper_blob = '\n'.join(helper_sources)
-
-    to_insert = [
-        ast.Expr(
-            value=ast.Call(
-                func=ast.Name(id='exec', ctx=ast.Load()),
-                args=[
-                    ast.Constant(value=helper_blob),
-                    ast.Call(
-                        func=ast.Name(id='globals', ctx=ast.Load()),
-                        args=[],
-                        keywords=[],
-                    ),
-                ],
-                keywords=[],
-            )
-        )
-    ]
-
-    if ast.AsyncFunctionDef in detector.presence:
-        to_insert.append(ast.Import(
-            names=[
-                ast.alias(
-                    name='types',
-                    asname=LIB_TYPES,
-                ),
-                ast.alias(
-                    name='collections.abc',
-                    asname=LIB_COLLECTIONS,
-                ),
-                ast.alias(
-                    name='inspect',
-                    asname=LIB_INSPECT,
-                )
-            ]
-        ))
-        to_insert.append(
-            ast.Expr(
-                value=ast.Call(
-                    func=ast.Attribute(
-                        value=ast.Attribute(
-                            value=ast.Attribute(
-                                value=ast.Name(id=LIB_COLLECTIONS, ctx=ast.Load()),
-                                attr='abc',
-                                ctx=ast.Load()
-                            ),
-                            attr='Coroutine',
-                            ctx=ast.Load()
-                        ),
-                        attr='register',
-                        ctx=ast.Load()
-                    ),
-                    args=[
-                        ast.Attribute(
-                            value=ast.Name(id=LIB_TYPES, ctx=ast.Load()),
-                            attr='GeneratorType',
-                            ctx=ast.Load()
-                        )
-                    ],
-                    keywords=[],
-                )
-            )
-        )
-
-    to_insert.append(
-        ast.Assign(
-            targets=[ast.Name(id=top_func_helper_var, ctx=ast.Store())],
-            value=ast.Call(
-                func=ast.Name(id=func_helper_name, ctx=ast.Load()),
-                args=[],
-                keywords=[],
-            ),
-        )
-    )
-
-    tree.body = to_insert + tree.body
-
-
-def parse_root(tree: ast.Module) -> ast.Module:
-    # Init the top frame
-    top_frame = Frame(None, [], [])
-    top_frame.temp_var_num = 0
-    top_frame.reserved_names = collect_user_names(tree)
-
-    # Transform "super()" to "super(cls, self)"
-    super_trans = SuperTransformer()
-    tree = super_trans.visit(tree)
-
-    top_frame.func_helper_var = top_frame.get_temp_var()
-    add_helper(tree, top_frame.func_helper_var)
-
-    expr = parse_stmts(tree.body, top_frame)
-    return ast.Module(
-        body=[
-            ast.Expr(
-                expr
-            )
-        ],
-        type_ignores=[],
     )
