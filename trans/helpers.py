@@ -4,11 +4,6 @@ import os
 from .passes import NodePresenceDetector
 
 
-def code2tree(code: str) -> ast.stmt:
-    tree = ast.parse(code)
-    return tree.body[0]
-
-
 def _load_runtime_module(filename: str) -> list:
     """Read a sibling runtime/<filename>.py, parse it, and return its
     top-level statement list. The file is processed at transform time
@@ -21,92 +16,48 @@ def _load_runtime_module(filename: str) -> list:
 
 
 try_helper_name = '_TryHelper'
-_try_helper_body = None
 
 
 def _get_try_helper_body() -> list:
-    global _try_helper_body
-    if _try_helper_body is None:
-        _try_helper_body = _load_runtime_module('try_helper.py')
-    return _try_helper_body
+    # Always re-parse — see _get_core_helper_body for why caching the
+    # parsed copy doesn't work.
+    return _load_runtime_module('try_helper.py')
 
 
 for_helper_name = '_ForHelper'
-for_helper_code = f"""
-class {for_helper_name}:
-    def __init__(self, iterable, func_helper):
-        self.iterable = iter(iterable)
-        self.stopped = False
-        self.func_helper = func_helper
-        self.last_yielded = None
-        self.was_iterated = False
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.func_helper.returned:
-            self.stopped = True
-        if self.stopped:
-            raise StopIteration
-        v = next(self.iterable)
-        self.last_yielded = v
-        self.was_iterated = True
-        return v
-
-    def stop(self):
-        self.stopped = True
-        return True
-"""
-for_helper = code2tree(for_helper_code)
-
 while_helper_name = '_WhileHelper'
-while_helper_code = f"""
-class {while_helper_name}:
-    def __init__(self, func_helper):
-        self.stopped = False
-        self.ended = False
-        self.func_helper = func_helper
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.func_helper.returned:
-            self.stopped = True
-        if self.stopped or self.ended:
-            raise StopIteration
-        return None
-
-    def stop(self):
-        self.stopped = True
-        return True
-
-    def cond(self, condition):
-        if condition:
-            return False
-        self.ended = True
-        return True
-"""
-while_helper = code2tree(while_helper_code)
-
 func_helper_name = '_FuncHelper'
-func_helper_code = f"""
-class {func_helper_name}:
-    def __init__(self):
-        self.returned = False
-        self.value = None
-
-    def do_return(self, v):
-        self.returned = True
-        self.value = v
-        return True
-"""
-func_helper = code2tree(func_helper_code)
 
 LIB_TYPES = '_types'
 LIB_COLLECTIONS = '_collections'
 LIB_INSPECT = '_inspect'
+
+
+def _get_core_helper_body() -> list:
+    """Top-level statements of trans/runtime/core.py: the three helper
+    class definitions. Each ClassDef (and every method nested inside)
+    is annotated with `_use_legacy_return = True`, so parse_class_def /
+    parse_function_def take the older `(value, True)` tuple-and-[0]
+    return convention and avoid referring to _FuncHelper while
+    _FuncHelper is itself being defined."""
+    # Always re-parse — parse_class_def mutates the body (appends
+    # `return locals()`), so reusing a single parsed copy across
+    # transforms accumulates injected returns.
+    body = _load_runtime_module('core.py')
+    kept = []
+    for stmt in body:
+        if isinstance(stmt, ast.ClassDef) and stmt.name in (
+            func_helper_name, for_helper_name, while_helper_name
+        ):
+            _mark_legacy_return(stmt)
+            kept.append(stmt)
+    return kept
+
+
+def _mark_legacy_return(node: ast.AST) -> None:
+    for n in ast.walk(node):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            n._use_legacy_return = True
 
 
 def add_helper(tree: ast.AST, top_func_helper_var: str):
@@ -120,33 +71,17 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
     needs_for = ast.For in detector.presence or ast.Try in detector.presence
     needs_while = ast.While in detector.presence or ast.Try in detector.presence
 
-    # Collect helper class source as a single exec'able blob, so the helper
-    # classes themselves do not get rewritten by parse_class_def. (If they
-    # did, _FuncHelper's class body would reference _FuncHelper before
-    # _FuncHelper is bound — chicken-and-egg.)
-    helper_sources = [func_helper_code]
-    if needs_for:
-        helper_sources.append(for_helper_code)
-    if needs_while:
-        helper_sources.append(while_helper_code)
-    helper_blob = '\n'.join(helper_sources)
+    # Pull in the three core helper classes; each is annotated for the
+    # legacy return convention so transforming them doesn't reference
+    # _FuncHelper before it's bound.
+    core_body = _get_core_helper_body()
+    core_by_name = {s.name: s for s in core_body}
 
-    to_insert = [
-        ast.Expr(
-            value=ast.Call(
-                func=ast.Name(id='exec', ctx=ast.Load()),
-                args=[
-                    ast.Constant(value=helper_blob),
-                    ast.Call(
-                        func=ast.Name(id='globals', ctx=ast.Load()),
-                        args=[],
-                        keywords=[],
-                    ),
-                ],
-                keywords=[],
-            )
-        )
-    ]
+    to_insert = [core_by_name[func_helper_name]]
+    if needs_for:
+        to_insert.append(core_by_name[for_helper_name])
+    if needs_while:
+        to_insert.append(core_by_name[while_helper_name])
 
     if ast.AsyncFunctionDef in detector.presence:
         to_insert.append(ast.Import(

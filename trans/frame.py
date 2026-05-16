@@ -13,6 +13,13 @@ class Frame:
     func_helper_var: Optional[str] = None
     reserved_names: Optional[set] = None  # only the top frame owns this
     exc_stack: list[str] = dataclasses.field(default_factory=list)
+    # Legacy return mode: emits the older `(value, True)` tuple-and-[0]
+    # convention instead of going through _FuncHelper. Used for the
+    # internal helper classes themselves (chicken-and-egg: their own
+    # bodies can't depend on _FuncHelper because they're defining it).
+    # Limitation of legacy mode: `return` inside a loop doesn't escape
+    # the loop. Helper methods don't do that, so they fit fine.
+    legacy_return: bool = False
 
     def get_temp_var_num(self) -> int:
         if self.temp_var_num is None:

@@ -47,43 +47,57 @@ def strip_arg_annotations(args: ast.arguments) -> None:
 
 def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
     temp_func_var = sub_frame.get_temp_var()
-    helper_var = sub_frame.func_helper_var
     strip_arg_annotations(stmt.args)
-    body_or = parse_stmts(stmt.body, frame=sub_frame)
-    lambda_body = ast.Subscript(
-        value=ast.Tuple(
-            elts=[
-                ast.BoolOp(
-                    op=ast.Or(),
-                    values=[
-                        ast.BoolOp(
-                            op=ast.And(),
-                            values=[
-                                ast.NamedExpr(
-                                    target=ast.Name(id=helper_var, ctx=ast.Store()),
-                                    value=ast.Call(
-                                        func=ast.Name(id=func_helper_name, ctx=ast.Load()),
-                                        args=[],
-                                        keywords=[],
-                                    ),
-                                ),
-                                ast.Constant(value=False),
-                            ],
-                        ),
-                        body_or,
-                    ],
-                ),
-                ast.Attribute(
-                    value=ast.Name(id=helper_var, ctx=ast.Load()),
-                    attr='value',
-                    ctx=ast.Load(),
-                ),
-            ],
+    if sub_frame.legacy_return:
+        # Legacy mode: append `return None` to the body so the body's Or
+        # chain ends with a (value, True) tuple, then take [0] in the
+        # lambda. Used by the internal helper classes themselves.
+        body = stmt.body
+        if not body or not isinstance(body[-1], ast.Return):
+            body = body + [ast.Return(value=ast.Constant(value=None))]
+        body_or = parse_stmts(body, frame=sub_frame)
+        lambda_body = ast.Subscript(
+            value=body_or,
+            slice=ast.Constant(value=0),
             ctx=ast.Load(),
-        ),
-        slice=ast.Constant(value=1),
-        ctx=ast.Load(),
-    )
+        )
+    else:
+        helper_var = sub_frame.func_helper_var
+        body_or = parse_stmts(stmt.body, frame=sub_frame)
+        lambda_body = ast.Subscript(
+            value=ast.Tuple(
+                elts=[
+                    ast.BoolOp(
+                        op=ast.Or(),
+                        values=[
+                            ast.BoolOp(
+                                op=ast.And(),
+                                values=[
+                                    ast.NamedExpr(
+                                        target=ast.Name(id=helper_var, ctx=ast.Store()),
+                                        value=ast.Call(
+                                            func=ast.Name(id=func_helper_name, ctx=ast.Load()),
+                                            args=[],
+                                            keywords=[],
+                                        ),
+                                    ),
+                                    ast.Constant(value=False),
+                                ],
+                            ),
+                            body_or,
+                        ],
+                    ),
+                    ast.Attribute(
+                        value=ast.Name(id=helper_var, ctx=ast.Load()),
+                        attr='value',
+                        ctx=ast.Load(),
+                    ),
+                ],
+                ctx=ast.Load(),
+            ),
+            slice=ast.Constant(value=1),
+            ctx=ast.Load(),
+        )
     return [
         ast.Assign(
             targets=[ast.Name(id=temp_func_var, ctx=ast.Store())],
@@ -114,11 +128,17 @@ def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
 
 def parse_function_def(stmt: ast.FunctionDef, frame: Frame) -> list[_ast.AST]:
     sub_frame = Frame(prev=frame, nonlocal_vars=[], global_vars=[])
-    # If the nonlocal pre-pass marked this function as the owner of one
-    # or more boxed variables, reuse that exact helper var name so the
-    # rewritten Attribute(Name('temp_N'), 'x') references stay correct.
-    box_var = getattr(stmt, '_box_helper_var', None)
-    sub_frame.func_helper_var = box_var if box_var is not None else sub_frame.get_temp_var()
+    # Inherit legacy mode from the enclosing frame, or pick it up from a
+    # transform-time annotation on the FunctionDef itself.
+    sub_frame.legacy_return = (
+        frame.legacy_return or getattr(stmt, '_use_legacy_return', False)
+    )
+    if not sub_frame.legacy_return:
+        # If the nonlocal pre-pass marked this function as the owner of one
+        # or more boxed variables, reuse that exact helper var name so the
+        # rewritten Attribute(Name('temp_N'), 'x') references stay correct.
+        box_var = getattr(stmt, '_box_helper_var', None)
+        sub_frame.func_helper_var = box_var if box_var is not None else sub_frame.get_temp_var()
     return gen_func(stmt, sub_frame)
 
 
@@ -128,7 +148,11 @@ def parse_async_function_def(stmt: ast.AsyncFunctionDef, frame: Frame) -> list[_
 
 def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
     sub_frame = Frame(prev=frame, nonlocal_vars=[], global_vars=[])
-    sub_frame.func_helper_var = sub_frame.get_temp_var()
+    sub_frame.legacy_return = (
+        frame.legacy_return or getattr(stmt, '_use_legacy_return', False)
+    )
+    if not sub_frame.legacy_return:
+        sub_frame.func_helper_var = sub_frame.get_temp_var()
     helper_var = sub_frame.func_helper_var
     cls_body = stmt.body
     cls_body.append(
@@ -146,41 +170,50 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
             metaclass = kwd.value
             break
 
-    body_or = parse_stmts(cls_body, frame=sub_frame)
-    cls_lambda_body = ast.Subscript(
-        value=ast.Tuple(
-            elts=[
-                ast.BoolOp(
-                    op=ast.Or(),
-                    values=[
-                        ast.BoolOp(
-                            op=ast.And(),
-                            values=[
-                                ast.NamedExpr(
-                                    target=ast.Name(id=helper_var, ctx=ast.Store()),
-                                    value=ast.Call(
-                                        func=ast.Name(id=func_helper_name, ctx=ast.Load()),
-                                        args=[],
-                                        keywords=[],
-                                    ),
-                                ),
-                                ast.Constant(value=False),
-                            ],
-                        ),
-                        body_or,
-                    ],
-                ),
-                ast.Attribute(
-                    value=ast.Name(id=helper_var, ctx=ast.Load()),
-                    attr='value',
-                    ctx=ast.Load(),
-                ),
-            ],
+    if sub_frame.legacy_return:
+        # Legacy: body's Or chain ends with (locals(), True); take [0].
+        body_or = parse_stmts(cls_body, frame=sub_frame)
+        cls_lambda_body = ast.Subscript(
+            value=body_or,
+            slice=ast.Constant(value=0),
             ctx=ast.Load(),
-        ),
-        slice=ast.Constant(value=1),
-        ctx=ast.Load(),
-    )
+        )
+    else:
+        body_or = parse_stmts(cls_body, frame=sub_frame)
+        cls_lambda_body = ast.Subscript(
+            value=ast.Tuple(
+                elts=[
+                    ast.BoolOp(
+                        op=ast.Or(),
+                        values=[
+                            ast.BoolOp(
+                                op=ast.And(),
+                                values=[
+                                    ast.NamedExpr(
+                                        target=ast.Name(id=helper_var, ctx=ast.Store()),
+                                        value=ast.Call(
+                                            func=ast.Name(id=func_helper_name, ctx=ast.Load()),
+                                            args=[],
+                                            keywords=[],
+                                        ),
+                                    ),
+                                    ast.Constant(value=False),
+                                ],
+                            ),
+                            body_or,
+                        ],
+                    ),
+                    ast.Attribute(
+                        value=ast.Name(id=helper_var, ctx=ast.Load()),
+                        attr='value',
+                        ctx=ast.Load(),
+                    ),
+                ],
+                ctx=ast.Load(),
+            ),
+            slice=ast.Constant(value=1),
+            ctx=ast.Load(),
+        )
 
     return [
         ast.Assign(
@@ -218,6 +251,16 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
 
 def parse_return(stmt: ast.Return, frame: Frame) -> list[_ast.AST]:
     value = stmt.value if stmt.value is not None else ast.Constant(value=None)
+    if frame.legacy_return:
+        # Old style: produce a (value, True) tuple so the body's Or
+        # chain short-circuits truthy. gen_func's `[0]` extraction
+        # picks `value` out at the lambda boundary.
+        return [
+            ast.Tuple(
+                elts=[value, ast.Constant(value=True)],
+                ctx=ast.Load(),
+            )
+        ]
     return [
         ast.Call(
             func=ast.Attribute(
