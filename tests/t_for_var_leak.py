@@ -210,3 +210,48 @@ def three_way_unpack():
 
 
 print(three_way_unpack())
+
+
+def starred_head():
+    for *head, tail in [[1, 2, 3], [4, 5, 6, 7]]:
+        pass
+    return (head, tail)
+
+
+print(starred_head())
+
+
+def starred_tail():
+    for first, *rest in [[1, 2, 3], [10, 20, 30, 40]]:
+        pass
+    return (first, rest)
+
+
+print(starred_tail())
+
+
+def starred_middle():
+    for a, *mid, c in [[1, 2, 3, 4], [10, 20, 30, 40, 50]]:
+        pass
+    return (a, mid, c)
+
+
+print(starred_middle())
+
+
+def starred_empty_iter_does_not_bind():
+    for *a, b in []:
+        pass
+    return ('a' in dir(), 'b' in dir())
+
+
+print(starred_empty_iter_does_not_bind())
+
+
+def starred_minimum_length():
+    for a, b, *rest in [(1, 2)]:
+        pass
+    return (a, b, rest)
+
+
+print(starred_minimum_length())

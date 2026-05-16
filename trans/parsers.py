@@ -1124,7 +1124,8 @@ def make_loop_var_escape(target, frame) -> ast.expr:
     explicitly.
 
     Supports plain Name targets and Tuple/List targets (`for a, b in
-    ...`). Starred targets (`for *a, b in ...`) fall back to no-op.
+    ...`), including a single Starred element anywhere in the tuple
+    (`for *a, b in ...`, `for a, *b in ...`, `for a, *b, c in ...`).
 
     The expression must always evaluate falsy so it doesn't short-
     circuit the surrounding Or chain — even when last_yielded is a
@@ -1148,22 +1149,92 @@ def make_loop_var_escape(target, frame) -> ast.expr:
         )
 
     if isinstance(target, (ast.Tuple, ast.List)) and all(
-        isinstance(e, ast.Name) for e in target.elts
+        isinstance(e, ast.Name) or
+        (isinstance(e, ast.Starred) and isinstance(e.value, ast.Name))
+        for e in target.elts
     ):
-        # for a, b in ...: rebind each name from last_yielded[i].
-        # Use a tuple of walruses then take a falsy element so the
-        # whole expression stays falsy regardless of the bound values.
+        # Materialize last_yielded once into a list so subscripting and
+        # slicing both work regardless of the iterable's underlying
+        # type. The list is bound via walrus, then each name is bound
+        # by index/slice from it.
+        materialized = frame.get_temp_var()
+        elts = target.elts
+        starred_idx = None
+        for i, e in enumerate(elts):
+            if isinstance(e, ast.Starred):
+                starred_idx = i
+                break
+
         binds = [
             ast.NamedExpr(
-                target=ast.Name(id=elt.id, ctx=ast.Store()),
-                value=ast.Subscript(
-                    value=last_yielded,
-                    slice=ast.Constant(value=i),
-                    ctx=ast.Load(),
+                target=ast.Name(id=materialized, ctx=ast.Store()),
+                value=ast.Call(
+                    func=ast.Name(id='list', ctx=ast.Load()),
+                    args=[last_yielded],
+                    keywords=[],
                 ),
             )
-            for i, elt in enumerate(target.elts)
         ]
+
+        def name_of(e):
+            return e.value.id if isinstance(e, ast.Starred) else e.id
+
+        if starred_idx is None:
+            for i, e in enumerate(elts):
+                binds.append(
+                    ast.NamedExpr(
+                        target=ast.Name(id=name_of(e), ctx=ast.Store()),
+                        value=ast.Subscript(
+                            value=ast.Name(id=materialized, ctx=ast.Load()),
+                            slice=ast.Constant(value=i),
+                            ctx=ast.Load(),
+                        ),
+                    )
+                )
+        else:
+            # Pre-star names from positive indices.
+            for i in range(starred_idx):
+                binds.append(
+                    ast.NamedExpr(
+                        target=ast.Name(id=name_of(elts[i]), ctx=ast.Store()),
+                        value=ast.Subscript(
+                            value=ast.Name(id=materialized, ctx=ast.Load()),
+                            slice=ast.Constant(value=i),
+                            ctx=ast.Load(),
+                        ),
+                    )
+                )
+            # Post-star names from negative indices.
+            after = len(elts) - starred_idx - 1
+            for j in range(after):
+                neg = -(after - j)
+                binds.append(
+                    ast.NamedExpr(
+                        target=ast.Name(id=name_of(elts[starred_idx + 1 + j]), ctx=ast.Store()),
+                        value=ast.Subscript(
+                            value=ast.Name(id=materialized, ctx=ast.Load()),
+                            slice=ast.Constant(value=neg),
+                            ctx=ast.Load(),
+                        ),
+                    )
+                )
+            # Starred name takes the middle slice.
+            upper = ast.Constant(value=-after) if after > 0 else ast.Constant(value=None)
+            binds.append(
+                ast.NamedExpr(
+                    target=ast.Name(id=name_of(elts[starred_idx]), ctx=ast.Store()),
+                    value=ast.Subscript(
+                        value=ast.Name(id=materialized, ctx=ast.Load()),
+                        slice=ast.Slice(
+                            lower=ast.Constant(value=starred_idx),
+                            upper=upper,
+                            step=None,
+                        ),
+                        ctx=ast.Load(),
+                    ),
+                )
+            )
+
         bind_tuple = ast.Subscript(
             value=ast.Tuple(
                 elts=binds + [ast.Constant(value=False)],
@@ -1180,8 +1251,8 @@ def make_loop_var_escape(target, frame) -> ast.expr:
             ],
         )
 
-    # Anything more exotic (Starred, nested unpacks) — give up and
-    # return a no-op falsy.
+    # Anything more exotic (nested unpacks) — give up and return a no-op
+    # falsy.
     return ast.Constant(value=False)
 
 
