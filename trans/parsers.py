@@ -420,6 +420,30 @@ def parse_assign(stmt: ast.Assign, frame: Frame) -> list[_ast.AST]:
 
     # Now is a simple assign like "a = 1"
     assert isinstance(target, ast.Name)
+    if target.id in frame.global_vars:
+        # `global x` was declared in this scope; route writes through
+        # globals() so they land in the module dict instead of the
+        # generated lambda's locals.
+        return [
+            ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Call(
+                            func=ast.Name(id='globals', ctx=ast.Load()),
+                            args=[],
+                            keywords=[],
+                        ),
+                        attr='__setitem__',
+                        ctx=ast.Load(),
+                    ),
+                    args=[
+                        ast.Constant(value=target.id),
+                        stmt.value,
+                    ],
+                    keywords=[],
+                )
+            )
+        ]
     return [
         ast.Expr(
             value=ast.NamedExpr(
@@ -776,7 +800,10 @@ def parse_import_from(stmt: ast.ImportFrom, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_global(stmt: ast.Global, frame: Frame) -> list[_ast.AST]:
-    pass
+    for name in stmt.names:
+        if name not in frame.global_vars:
+            frame.global_vars.append(name)
+    return [ast.Constant(value=False)]
 
 
 def parse_nonlocal(stmt: ast.Nonlocal, frame: Frame) -> list[_ast.AST]:
