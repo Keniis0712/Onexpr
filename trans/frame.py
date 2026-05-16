@@ -12,6 +12,7 @@ class Frame:
     loops: list[str] = dataclasses.field(default_factory=list)
     func_helper_var: Optional[str] = None
     reserved_names: Optional[set] = None  # only the top frame owns this
+    exc_stack: list[str] = dataclasses.field(default_factory=list)
 
     def get_temp_var_num(self) -> int:
         if self.temp_var_num is None:

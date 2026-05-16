@@ -1,4 +1,5 @@
 import ast
+import os
 
 from .passes import NodePresenceDetector
 
@@ -6,6 +7,28 @@ from .passes import NodePresenceDetector
 def code2tree(code: str) -> ast.stmt:
     tree = ast.parse(code)
     return tree.body[0]
+
+
+def _load_runtime_module(filename: str) -> list:
+    """Read a sibling runtime/<filename>.py, parse it, and return its
+    top-level statement list. The file is processed at transform time
+    (not imported), so its statements get woven into the user's tree
+    and pass through the full onexpr transformation."""
+    path = os.path.join(os.path.dirname(__file__), 'runtime', filename)
+    with open(path, encoding='utf-8') as f:
+        src = f.read()
+    return ast.parse(src).body
+
+
+try_helper_name = '_TryHelper'
+_try_helper_body = None
+
+
+def _get_try_helper_body() -> list:
+    global _try_helper_body
+    if _try_helper_body is None:
+        _try_helper_body = _load_runtime_module('try_helper.py')
+    return _try_helper_body
 
 
 for_helper_name = '_ForHelper'
@@ -91,14 +114,20 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
     detector = NodePresenceDetector()
     detector.visit(tree)
 
+    # The try-helper runtime contains for-loops and while-loops, so
+    # injecting it pulls in _ForHelper / _WhileHelper as a transitive
+    # dependency.
+    needs_for = ast.For in detector.presence or ast.Try in detector.presence
+    needs_while = ast.While in detector.presence or ast.Try in detector.presence
+
     # Collect helper class source as a single exec'able blob, so the helper
     # classes themselves do not get rewritten by parse_class_def. (If they
     # did, _FuncHelper's class body would reference _FuncHelper before
     # _FuncHelper is bound — chicken-and-egg.)
     helper_sources = [func_helper_code]
-    if ast.For in detector.presence:
+    if needs_for:
         helper_sources.append(for_helper_code)
-    if ast.While in detector.presence:
+    if needs_while:
         helper_sources.append(while_helper_code)
     helper_blob = '\n'.join(helper_sources)
 
@@ -174,5 +203,13 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
             ),
         )
     )
+
+    # Inject the try/except runtime helper if the user code uses `try`.
+    # Unlike the for/while/func helpers (whose class definitions are
+    # exec'd as a string blob to avoid chicken-and-egg with _FuncHelper),
+    # the try helper is a regular set of top-level statements that goes
+    # through the full onexpr transformation along with user code.
+    if ast.Try in detector.presence:
+        to_insert = to_insert + _get_try_helper_body()
 
     tree.body = to_insert + tree.body

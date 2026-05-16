@@ -204,6 +204,113 @@ def _collect_direct_nonlocal_decls(fdef) -> set:
     return decls
 
 
+def _collect_try_clause_assigns(fdef) -> set:
+    """Names assigned inside any try clause directly within fdef's body
+    (body / except / else / finally), but not inside nested function
+    or class bodies. These need to be boxed because each try clause is
+    rewritten into its own lambda — assignments inside that lambda
+    can't propagate to the enclosing scope without a shared box."""
+    names = set()
+
+    def add_target(t):
+        if isinstance(t, ast.Name):
+            names.add(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                add_target(e)
+        elif isinstance(t, ast.Starred):
+            add_target(t.value)
+
+    class _ClauseWalker(ast.NodeVisitor):
+        """Walks a try clause body collecting bound names. Stops at
+        nested def/class/lambda boundaries (those have their own
+        scopes that handle their own boxing)."""
+        def visit_FunctionDef(self, node): pass
+        def visit_AsyncFunctionDef(self, node): pass
+        def visit_ClassDef(self, node): pass
+        def visit_Lambda(self, node): pass
+
+        def visit_Assign(self, node):
+            for t in node.targets:
+                add_target(t)
+            self.visit(node.value)
+
+        def visit_AugAssign(self, node):
+            add_target(node.target)
+            self.visit(node.value)
+
+        def visit_AnnAssign(self, node):
+            add_target(node.target)
+            if node.value is not None:
+                self.visit(node.value)
+
+        def visit_For(self, node):
+            add_target(node.target)
+            self.visit(node.iter)
+            for s in node.body + node.orelse:
+                self.visit(s)
+
+        def visit_AsyncFor(self, node):
+            self.visit_For(node)
+
+        def visit_With(self, node):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    add_target(item.optional_vars)
+                self.visit(item.context_expr)
+            for s in node.body:
+                self.visit(s)
+
+        def visit_AsyncWith(self, node):
+            self.visit_With(node)
+
+        def visit_ExceptHandler(self, node):
+            # Don't collect node.name — that's handled as a lambda
+            # parameter by parse_try, not as a boxed local. Walk into
+            # the body so real assignments inside the handler are
+            # collected.
+            for s in node.body:
+                self.visit(s)
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name.split('.')[0])
+
+        def visit_ImportFrom(self, node):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name)
+
+    class _TryFinder(ast.NodeVisitor):
+        """Finds every try statement directly in fdef's body (skipping
+        nested function/class/lambda bodies, which would be other
+        owners' problems). For each try, walks the clauses with
+        _ClauseWalker."""
+        def visit_FunctionDef(self, node): pass
+        def visit_AsyncFunctionDef(self, node): pass
+        def visit_ClassDef(self, node): pass
+        def visit_Lambda(self, node): pass
+
+        def visit_Try(self, node):
+            cw = _ClauseWalker()
+            for stmt_list in (node.body, node.orelse, node.finalbody):
+                for s in stmt_list:
+                    cw.visit(s)
+            for handler in node.handlers:
+                cw.visit(handler)
+            # Recurse into the try clauses for nested try statements.
+            for stmt_list in (node.body, node.orelse, node.finalbody):
+                for s in stmt_list:
+                    self.visit(s)
+            for handler in node.handlers:
+                for s in handler.body:
+                    self.visit(s)
+
+    finder = _TryFinder()
+    for stmt in fdef.body:
+        finder.visit(stmt)
+    return names
+
+
 def _annotate_bound_names(tree):
     class _A(ast.NodeVisitor):
         def visit_FunctionDef(self, node):
@@ -219,7 +326,15 @@ def _annotate_bound_names(tree):
 
 def _resolve_owners(tree) -> dict:
     """Return {id(FunctionDef): set(boxed_names)} — for each function,
-    which of its locals are referenced by `nonlocal` in some descendant.
+    which of its locals must be boxed.
+
+    Two reasons a local needs boxing:
+    1. Some descendant function declared it `nonlocal` (the original
+       Python semantics).
+    2. The function contains a `try` statement and the local is
+       assigned inside one of the try clauses. Each try clause is
+       rewritten into its own lambda, so without a box the assignment
+       is lost when the lambda returns.
     """
     boxed = {}
 
@@ -234,12 +349,18 @@ def _resolve_owners(tree) -> dict:
                         boxed.setdefault(id(outer), set()).add(name)
                         break
                 # If no owner (invalid Python), silently drop.
+
+            # Box every local that's assigned inside a try clause in
+            # this function — the try clauses become their own lambdas
+            # so writes need a shared container.
+            for name in _collect_try_clause_assigns(node):
+                if name in node._bound_names:
+                    boxed.setdefault(id(node), set()).add(name)
+
             new_stack = func_stack + [node]
             for child in ast.iter_child_nodes(node):
                 visit(child, new_stack)
         elif isinstance(node, ast.ClassDef):
-            # Class body is a scope but doesn't show up in nonlocal
-            # resolution chains.
             for child in ast.iter_child_nodes(node):
                 visit(child, func_stack)
         else:
