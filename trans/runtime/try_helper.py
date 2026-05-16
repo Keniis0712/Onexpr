@@ -171,6 +171,72 @@ class _TryHelper:
         return e1
 
     @staticmethod
+    def dispatch_star(body_fn, handlers, else_fn, func_helper, loop_helper):
+        """Implement PEP 654 `try / except*` semantics.
+
+        Each handler matches a *part* of the (possibly nested) exception
+        group. Names captured by `as` are the matched sub-group, not a
+        single exception. Anything not matched is propagated, alongside
+        any exceptions that the handlers themselves raised.
+
+        Roughly:
+          - Wrap the body's exception in a BaseExceptionGroup if it
+            wasn't one already (so split() works uniformly).
+          - For each handler, split the remaining group: matched goes
+            to the handler, rest is carried forward.
+          - At the end, fold the unmatched remainder together with any
+            new exceptions handlers raised into a single group.
+        """
+        e1 = _TryHelper.guarded(body_fn)
+        if e1 is None:
+            terminated = func_helper.returned
+            if not terminated and loop_helper is not None:
+                terminated = loop_helper.stopped
+            if not terminated and else_fn is not None:
+                return _TryHelper.guarded(else_fn)
+            return None
+
+        body_was_group = isinstance(e1, BaseExceptionGroup)
+        remaining = e1 if body_was_group else BaseExceptionGroup('', [e1])
+        raised = []
+
+        for exc_types, handler in handlers:
+            if remaining is None:
+                break
+            matched, remaining = remaining.split(exc_types)
+            if matched is not None:
+                e2 = _TryHelper.guarded(lambda m=matched: handler(m))
+                if e2 is not None:
+                    if e2.__context__ is None and e2 is not matched:
+                        e2.__context__ = matched
+                    raised.append(e2)
+
+        # PEP 654: how the result is shaped depends on whether the
+        # body's original exception was a group and on what's left.
+        leftover = list(remaining.exceptions) if remaining is not None else []
+
+        if not leftover and not raised:
+            return None
+
+        if not body_was_group and not leftover and len(raised) == 1:
+            # Body raised a single non-group exception, the handler
+            # caught it cleanly and itself raised one new exception.
+            # Don't wrap — propagate the new exception as-is.
+            return raised[0]
+
+        if not body_was_group and not raised and leftover == [e1]:
+            # Body raised a single non-group exception that no handler
+            # matched. Propagate it bare — Python doesn't wrap it.
+            return e1
+
+        if not leftover and len(raised) == 1 and not isinstance(raised[0], BaseExceptionGroup):
+            # All sub-exceptions were handled and the handlers raised
+            # exactly one non-group exception. Propagate it bare.
+            return raised[0]
+
+        return BaseExceptionGroup('', leftover + raised)
+
+    @staticmethod
     def with_block(mgr, body_fn):
         """Implement `with mgr: body_fn()` per PEP 343.
 

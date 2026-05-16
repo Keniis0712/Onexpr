@@ -305,6 +305,9 @@ def _collect_try_clause_assigns(fdef) -> set:
                 for s in handler.body:
                     self.visit(s)
 
+        def visit_TryStar(self, node):
+            self.visit_Try(node)
+
         def visit_With(self, node):
             cw = _ClauseWalker()
             for s in node.body:
@@ -633,6 +636,9 @@ def _collect_module_top_try_assigns(tree) -> set:
                 for s in h.body:
                     self.visit(s)
             self.in_try -= 1
+
+        def visit_TryStar(self, node):
+            self.visit_Try(node)
 
         def visit_With(self, node):
             self.in_try += 1

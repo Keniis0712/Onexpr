@@ -75,6 +75,7 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
     # dependency. `with` also uses the try-helper (its with_block).
     needs_try_runtime = (
         ast.Try in detector.presence
+        or ast.TryStar in detector.presence
         or ast.With in detector.presence
         or ast.AsyncWith in detector.presence
     )

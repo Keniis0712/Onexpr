@@ -986,6 +986,10 @@ def parse_raise(stmt: ast.Raise, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_try(stmt: ast.Try, frame: Frame) -> list[_ast.AST]:
+    return _parse_try_common(stmt, frame, dispatch_attr='dispatch')
+
+
+def _parse_try_common(stmt, frame: Frame, dispatch_attr: str) -> list[_ast.AST]:
     helper_name = ast.Name(id=frame.func_helper_var, ctx=ast.Load())
     loop_name = (
         ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load())
@@ -1066,7 +1070,7 @@ def parse_try(stmt: ast.Try, frame: Frame) -> list[_ast.AST]:
             value=ast.Call(
                 func=ast.Attribute(
                     value=ast.Name(id=try_helper_name, ctx=ast.Load()),
-                    attr='dispatch',
+                    attr=dispatch_attr,
                     ctx=ast.Load(),
                 ),
                 args=[body_lambda, handlers_list, else_lambda, helper_name, loop_name],
@@ -1248,7 +1252,7 @@ def parse_try(stmt: ast.Try, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_try_star(stmt: ast.TryStar, frame: Frame) -> list[_ast.AST]:
-    pass
+    return _parse_try_common(stmt, frame, dispatch_attr='dispatch_star')
 
 
 def parse_assert(stmt: ast.Assert, frame: Frame) -> list[_ast.AST]:
