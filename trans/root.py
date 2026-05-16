@@ -2,6 +2,7 @@ import ast
 
 from .frame import Frame
 from .helpers import add_helper
+from .nonlocals import apply_nonlocal_pass
 from .parsers import parse_stmts
 from .passes import SuperTransformer, collect_user_names
 
@@ -15,6 +16,12 @@ def parse_root(tree: ast.Module) -> ast.Module:
     # Transform "super()" to "super(cls, self)"
     super_trans = SuperTransformer()
     tree = super_trans.visit(tree)
+
+    # Resolve `nonlocal`: walk the tree, find the owner function for
+    # each declared name, and rewrite reads/writes to go through the
+    # owner's box. Run before add_helper so the injected helper class
+    # source isn't itself rewritten.
+    apply_nonlocal_pass(tree, top_frame.get_temp_var)
 
     top_frame.func_helper_var = top_frame.get_temp_var()
     add_helper(tree, top_frame.func_helper_var)

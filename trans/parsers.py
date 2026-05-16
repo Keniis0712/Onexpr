@@ -114,7 +114,11 @@ def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
 
 def parse_function_def(stmt: ast.FunctionDef, frame: Frame) -> list[_ast.AST]:
     sub_frame = Frame(prev=frame, nonlocal_vars=[], global_vars=[])
-    sub_frame.func_helper_var = sub_frame.get_temp_var()
+    # If the nonlocal pre-pass marked this function as the owner of one
+    # or more boxed variables, reuse that exact helper var name so the
+    # rewritten Attribute(Name('temp_N'), 'x') references stay correct.
+    box_var = getattr(stmt, '_box_helper_var', None)
+    sub_frame.func_helper_var = box_var if box_var is not None else sub_frame.get_temp_var()
     return gen_func(stmt, sub_frame)
 
 
@@ -807,7 +811,10 @@ def parse_global(stmt: ast.Global, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_nonlocal(stmt: ast.Nonlocal, frame: Frame) -> list[_ast.AST]:
-    pass
+    # The nonlocal pre-pass already rewrote every read/write of these
+    # names to go through the owner function's box, so the declaration
+    # itself becomes a no-op at this point.
+    return [ast.Constant(value=False)]
 
 
 def parse_expr(stmt: ast.Expr, frame: Frame) -> list[_ast.AST]:
