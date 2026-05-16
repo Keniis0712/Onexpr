@@ -169,3 +169,48 @@ class _TryHelper:
                 return e2
         # unhandled — surface the body exception
         return e1
+
+    @staticmethod
+    def with_block(mgr, body_fn):
+        """Implement `with mgr: body_fn()` per PEP 343.
+
+        Returns the exception that should propagate (or None). The
+        caller is expected to bind `mgr.__enter__()`'s return value
+        to the `as` target before calling body_fn (we don't do that
+        here because the bind happens in the caller's scope, not in
+        body_fn's lambda).
+
+        - body runs cleanly: call __exit__(None, None, None), return
+          its raise (None on success).
+        - body raises: call __exit__(type, exc, tb). If __exit__
+          returns truthy, swallow; otherwise propagate. If __exit__
+          itself raises, that supersedes (with __context__ chained).
+        """
+        # Resolve __exit__ on the type, mirroring CPython.
+        exit_fn = type(mgr).__exit__
+        e_body = _TryHelper.guarded(body_fn)
+        if e_body is None:
+            # No body exception. Call __exit__ with all-None and let
+            # any raise it makes propagate.
+            holder = [None]
+
+            def call_exit_none():
+                exit_fn(mgr, None, None, None)
+                # we don't care about the return value here
+            return _TryHelper.guarded(call_exit_none)
+        # body raised. Call __exit__ with (type, exc, tb) and capture
+        # both its return value (for the swallow check) and any new
+        # exception it raises.
+        holder = [None]
+
+        def call_exit_with_exc():
+            holder[0] = exit_fn(mgr, type(e_body), e_body, e_body.__traceback__)
+        e_exit = _TryHelper.guarded(call_exit_with_exc)
+        if e_exit is not None:
+            if e_exit.__context__ is None and e_exit is not e_body:
+                e_exit.__context__ = e_body
+            return e_exit
+        if holder[0]:
+            # __exit__ returned truthy; exception is swallowed.
+            return None
+        return e_body

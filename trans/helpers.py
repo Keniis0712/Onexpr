@@ -72,9 +72,14 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
 
     # The try-helper runtime contains for-loops and while-loops, so
     # injecting it pulls in _ForHelper / _WhileHelper as a transitive
-    # dependency.
-    needs_for = ast.For in detector.presence or ast.Try in detector.presence
-    needs_while = ast.While in detector.presence or ast.Try in detector.presence
+    # dependency. `with` also uses the try-helper (its with_block).
+    needs_try_runtime = (
+        ast.Try in detector.presence
+        or ast.With in detector.presence
+        or ast.AsyncWith in detector.presence
+    )
+    needs_for = ast.For in detector.presence or needs_try_runtime
+    needs_while = ast.While in detector.presence or needs_try_runtime
 
     # Pull in the three core helper classes; each is annotated for the
     # legacy return convention so transforming them doesn't reference
@@ -153,7 +158,7 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
     # exec'd as a string blob to avoid chicken-and-egg with _FuncHelper),
     # the try helper is a regular set of top-level statements that goes
     # through the full onexpr transformation along with user code.
-    if ast.Try in detector.presence:
+    if needs_try_runtime:
         to_insert = to_insert + _get_try_helper_body()
 
     tree.body = to_insert + tree.body

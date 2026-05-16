@@ -281,10 +281,10 @@ def _collect_try_clause_assigns(fdef) -> set:
                 names.add(alias.asname if alias.asname else alias.name)
 
     class _TryFinder(ast.NodeVisitor):
-        """Finds every try statement directly in fdef's body (skipping
-        nested function/class/lambda bodies, which would be other
-        owners' problems). For each try, walks the clauses with
-        _ClauseWalker."""
+        """Finds every try OR with statement directly in fdef's body
+        (skipping nested function/class/lambda bodies, which would be
+        other owners' problems). For each, walks the clauses with
+        _ClauseWalker so the assigned names get boxed."""
         def visit_FunctionDef(self, node): pass
         def visit_AsyncFunctionDef(self, node): pass
         def visit_ClassDef(self, node): pass
@@ -304,6 +304,21 @@ def _collect_try_clause_assigns(fdef) -> set:
             for handler in node.handlers:
                 for s in handler.body:
                     self.visit(s)
+
+        def visit_With(self, node):
+            cw = _ClauseWalker()
+            for s in node.body:
+                cw.visit(s)
+            # Note: `with ctx as x:` binds x as a regular outer-scope
+            # assignment (parse_with emits an Assign at the with's
+            # outer level, not inside the body lambda), so x doesn't
+            # need boxing.
+            # Recurse into the body for nested try/with.
+            for s in node.body:
+                self.visit(s)
+
+        def visit_AsyncWith(self, node):
+            self.visit_With(node)
 
     finder = _TryFinder()
     for stmt in fdef.body:
@@ -618,6 +633,15 @@ def _collect_module_top_try_assigns(tree) -> set:
                 for s in h.body:
                     self.visit(s)
             self.in_try -= 1
+
+        def visit_With(self, node):
+            self.in_try += 1
+            for s in node.body:
+                self.visit(s)
+            self.in_try -= 1
+
+        def visit_AsyncWith(self, node):
+            self.visit_With(node)
 
         def _add_target(self, t):
             if isinstance(t, ast.Name):

@@ -755,7 +755,166 @@ def parse_if(stmt: ast.If, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_with(stmt: ast.With, frame: Frame) -> list[_ast.AST]:
-    pass
+    # `with a, b as x: BODY` is equivalent to `with a: with b as x: BODY`.
+    # Unwrap multiple items into nested Withs and let the recursion
+    # below (parse_stmts -> parse_stmt -> parse_with) handle the rest.
+    if len(stmt.items) > 1:
+        first, *rest = stmt.items
+        inner = ast.With(items=rest, body=stmt.body)
+        return [ast.With(items=[first], body=[inner])]
+
+    item = stmt.items[0]
+    helper_name_node = ast.Name(id=frame.func_helper_var, ctx=ast.Load())
+    loop_name_node = (
+        ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load())
+        if frame.loops else ast.Constant(value=None)
+    )
+
+    # Allocate a temp to hold the manager so __enter__ runs once and
+    # __exit__ later refers to the same instance. PEP 343 says
+    # __exit__ must be looked up on the type, not the instance — our
+    # _TryHelper.with_block does that, so emit `mgr.__enter__()` here
+    # but pass mgr to with_block.
+    mgr_var = frame.get_temp_var()
+
+    stmts = [
+        ast.Assign(
+            targets=[ast.Name(id=mgr_var, ctx=ast.Store())],
+            value=item.context_expr,
+        ),
+    ]
+
+    # Bind the `as` target if present. We resolve __enter__ via
+    # type(mgr).__enter__(mgr) to mirror CPython's behavior of
+    # ignoring instance attribute shadowing.
+    enter_call = ast.Call(
+        func=ast.Attribute(
+            value=ast.Call(
+                func=ast.Name(id='type', ctx=ast.Load()),
+                args=[ast.Name(id=mgr_var, ctx=ast.Load())],
+                keywords=[],
+            ),
+            attr='__enter__',
+            ctx=ast.Load(),
+        ),
+        args=[ast.Name(id=mgr_var, ctx=ast.Load())],
+        keywords=[],
+    )
+    if item.optional_vars is not None:
+        stmts.append(
+            ast.Assign(
+                targets=[item.optional_vars],
+                value=enter_call,
+            )
+        )
+    else:
+        # Still call __enter__ for its side effect / required by PEP 343,
+        # just discard the value.
+        stmts.append(ast.Expr(value=enter_call))
+
+    # Body lambda
+    body_or = parse_stmts(stmt.body, frame)
+    body_lambda = ast.Lambda(
+        args=ast.arguments(
+            posonlyargs=[], args=[], vararg=None,
+            kwonlyargs=[], kw_defaults=[], defaults=[],
+        ),
+        body=body_or,
+    )
+
+    e_pending = frame.get_temp_var()
+    # e_pending = _TryHelper.with_block(mgr, body_lambda)
+    stmts.append(
+        ast.Assign(
+            targets=[ast.Name(id=e_pending, ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=try_helper_name, ctx=ast.Load()),
+                    attr='with_block',
+                    ctx=ast.Load(),
+                ),
+                args=[
+                    ast.Name(id=mgr_var, ctx=ast.Load()),
+                    body_lambda,
+                ],
+                keywords=[],
+            ),
+        )
+    )
+
+    # if e_pending is not None and not helper.returned [and not loop.stopped]:
+    #     throw e_pending
+    throw_expr = ast.Expr(
+        value=ast.Call(
+            func=ast.Attribute(
+                value=ast.GeneratorExp(
+                    elt=ast.Constant(value=None),
+                    generators=[
+                        ast.comprehension(
+                            target=ast.Name(id='_', ctx=ast.Store()),
+                            iter=ast.List(elts=[], ctx=ast.Load()),
+                            ifs=[],
+                            is_async=0,
+                        )
+                    ],
+                ),
+                attr='throw',
+                ctx=ast.Load(),
+            ),
+            args=[ast.Name(id=e_pending, ctx=ast.Load())],
+            keywords=[],
+        )
+    )
+    not_returned = ast.UnaryOp(
+        op=ast.Not(),
+        operand=ast.Attribute(value=helper_name_node, attr='returned', ctx=ast.Load()),
+    )
+    throw_test_terms = [
+        ast.Compare(
+            left=ast.Name(id=e_pending, ctx=ast.Load()),
+            ops=[ast.IsNot()],
+            comparators=[ast.Constant(value=None)],
+        ),
+        not_returned,
+    ]
+    if frame.loops:
+        throw_test_terms.append(
+            ast.UnaryOp(
+                op=ast.Not(),
+                operand=ast.Attribute(value=loop_name_node, attr='stopped', ctx=ast.Load()),
+            )
+        )
+    stmts.append(
+        ast.If(
+            test=ast.BoolOp(op=ast.And(), values=throw_test_terms),
+            body=[throw_expr],
+            orelse=[],
+        )
+    )
+
+    # Return / break / continue propagators (same as parse_try).
+    stmts.append(make_return_propagator(frame))
+    if frame.loops:
+        loop_ref = ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load())
+        stmts.append(
+            ast.BoolOp(
+                op=ast.And(),
+                values=[
+                    ast.Attribute(value=loop_ref, attr='stopped', ctx=ast.Load()),
+                    ast.Constant(value=True),
+                ],
+            )
+        )
+        stmts.append(
+            ast.BoolOp(
+                op=ast.And(),
+                values=[
+                    ast.Attribute(value=loop_ref, attr='pending_continue', ctx=ast.Load()),
+                    ast.Constant(value=True),
+                ],
+            )
+        )
+    return stmts
 
 
 def parse_async_with(stmt: ast.AsyncWith, frame: Frame) -> list[_ast.AST]:
