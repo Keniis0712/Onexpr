@@ -433,7 +433,7 @@ def _lambda_arg_names(args) -> set:
     return names
 
 
-def _rewrite(tree, boxed, helper_name_for, module_boxed=frozenset(), module_helper_var=None):
+def _rewrite(tree, boxed, helper_name_for):
     def visit(node, lookup):
         if node is None:
             return None
@@ -567,33 +567,40 @@ def _rewrite(tree, boxed, helper_name_for, module_boxed=frozenset(), module_help
         return node
 
     def top_lookup(name):
-        if name in module_boxed:
-            return (module_helper_var, name)
         return None
 
     visit(tree, top_lookup)
 
 
-def apply_nonlocal_pass(tree, name_provider, module_helper_var=None) -> None:
+def apply_nonlocal_pass(tree, name_provider, module_helper_var=None, top_frame=None) -> None:
     """Rewrite `tree` in place so that nonlocal-targeted names go
     through their owner's box. `name_provider` is a zero-arg callable
     returning a fresh temp variable name; we use it to allocate a
     helper-var name for each owner function.
 
-    `module_helper_var`, if given, is the name of the module-level
-    _FuncHelper instance. We use it to box names assigned inside
-    top-level try clauses (each try clause becomes its own lambda, so
-    those assignments would otherwise be lost). Names declared global
-    are kept as plain global writes."""
+    `top_frame`, if given, is treated as the module-level Frame; we add
+    every name assigned inside a top-level `try` clause to its
+    `global_vars` so parse_assign rewrites those writes to
+    `globals().__setitem__('name', value)`. Without this, the
+    assignment lands in the per-clause lambda's own locals and never
+    surfaces to the module scope.
+
+    `module_helper_var` is retained for compatibility but is no longer
+    used by this pass — module-level try-clause assigns now go through
+    globals() instead of a helper-attribute box.
+    """
     _annotate_bound_names(tree)
     boxed = _resolve_owners(tree)
 
-    # Collect module-level try-clause assignments, if any.
-    module_boxed = set()
-    if module_helper_var is not None:
-        module_boxed = _collect_module_top_try_assigns(tree)
+    # Module-level try-clause assignments: route through globals() so
+    # they become real module attributes (visible to subsequent code
+    # AND to importers of the transformed module).
+    if top_frame is not None:
+        for name in _collect_module_top_try_assigns(tree):
+            if name not in top_frame.global_vars:
+                top_frame.global_vars.append(name)
 
-    if not boxed and not module_boxed:
+    if not boxed:
         return  # nothing to do
 
     helper_name = {}
@@ -605,7 +612,7 @@ def apply_nonlocal_pass(tree, name_provider, module_helper_var=None) -> None:
             func_node._box_helper_var = helper_name[key]
         return helper_name[key]
 
-    _rewrite(tree, boxed, helper_name_for, module_boxed, module_helper_var)
+    _rewrite(tree, boxed, helper_name_for)
 
 
 def _collect_module_top_try_assigns(tree) -> set:

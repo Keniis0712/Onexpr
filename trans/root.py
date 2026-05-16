@@ -30,6 +30,7 @@ def parse_root(tree: ast.Module) -> ast.Module:
         tree,
         top_frame.get_temp_var,
         module_helper_var=top_frame.func_helper_var,
+        top_frame=top_frame,
     )
 
     add_helper(tree, top_frame.func_helper_var)
