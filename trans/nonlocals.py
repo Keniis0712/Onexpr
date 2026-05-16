@@ -29,6 +29,14 @@ Two passes over the module:
 import ast
 
 
+# Prefix attached to the user-facing variable name when it's stored on
+# the owner's _FuncHelper. Without it, a user variable called `value` or
+# `returned` would clash with the helper's own fields (used by the
+# return machinery) — _FuncHelper.value is overwritten by do_return at
+# function exit, so a boxed `value = ...` would later read back wrong.
+_BOX_ATTR_PREFIX = '_b_'
+
+
 def _bound_names_in_function_body(fdef) -> set:
     """Names bound directly in this function's body — parameters,
     assignment targets, for-loop targets, with-as targets, except-as
@@ -283,7 +291,7 @@ def _rewrite(tree, boxed, helper_name_for):
                 helper_var, attr = hit
                 return ast.Attribute(
                     value=ast.Name(id=helper_var, ctx=ast.Load()),
-                    attr=attr,
+                    attr=_BOX_ATTR_PREFIX + attr,
                     ctx=node.ctx,
                 )
             return node
