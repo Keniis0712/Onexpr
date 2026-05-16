@@ -396,6 +396,18 @@ def loop_var_visible_after_loop():
 print(loop_var_visible_after_loop())
 
 
+def loop_var_after_break():
+    last = -1
+    for i in range(10):
+        if i >= 4:
+            break
+        last = i
+    return (i, last)
+
+
+print(loop_var_after_break())
+
+
 def early_return_inside_three_levels():
     log = []
     for a in range(3):
@@ -414,13 +426,11 @@ print(len(r[3]))
 
 def break_in_for_iterates_to_value():
     seen = []
-    last = None
     for v in 'abcdef':
         seen.append(v)
-        last = v
         if v == 'c':
             break
-    return (seen, last)
+    return (seen, v)
 
 
 print(break_in_for_iterates_to_value())

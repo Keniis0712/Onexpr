@@ -399,9 +399,39 @@ def parse_for(stmt: ast.For, frame: Frame) -> list[_ast.AST]:
         stmts.append(
             add_orelse(stmt.orelse, frame)
         )
+    stmts.append(make_loop_var_escape(stmt.target, frame))
     stmts.append(make_return_propagator(frame))
     frame.exit_loop()
     return stmts
+
+
+def make_loop_var_escape(target, frame) -> ast.expr:
+    """Surface the for-loop target to the enclosing scope.
+
+    Python binds `i` after `for i in ...:` to the last iterated value
+    (and leaves `i` unbound when the iterable was empty). The ListComp
+    we rewrite to has its own scope, so we have to re-emit the binding
+    explicitly. We only handle simple Name targets; tuple-unpack targets
+    (`for a, b in ...`) silently keep the old non-leaking behavior.
+
+    The expression must always evaluate falsy so it doesn't short-circuit
+    the surrounding Or chain — even when last_yielded is a truthy value.
+    """
+    if not isinstance(target, ast.Name):
+        # Fall back to a no-op (falsy) so it doesn't break the Or chain.
+        return ast.Constant(value=False)
+    helper = ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load())
+    return ast.BoolOp(
+        op=ast.And(),
+        values=[
+            ast.Attribute(value=helper, attr='was_iterated', ctx=ast.Load()),
+            ast.NamedExpr(
+                target=ast.Name(id=target.id, ctx=ast.Store()),
+                value=ast.Attribute(value=helper, attr='last_yielded', ctx=ast.Load()),
+            ),
+            ast.Constant(value=False),
+        ],
+    )
 
 
 def make_return_propagator(frame: Frame) -> ast.expr:

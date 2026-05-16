@@ -15,6 +15,8 @@ class {for_helper_name}:
         self.iterable = iter(iterable)
         self.stopped = False
         self.func_helper = func_helper
+        self.last_yielded = None
+        self.was_iterated = False
 
     def __iter__(self):
         return self
@@ -24,7 +26,10 @@ class {for_helper_name}:
             self.stopped = True
         if self.stopped:
             raise StopIteration
-        return next(self.iterable)
+        v = next(self.iterable)
+        self.last_yielded = v
+        self.was_iterated = True
+        return v
 
     def stop(self):
         self.stopped = True
