@@ -302,3 +302,122 @@ def assignment_in_handler_visible_outside():
 
 
 print(assignment_in_handler_visible_outside())
+
+
+def continue_in_try_skips_after():
+    out = []
+    for i in range(4):
+        try:
+            if i % 2 == 0:
+                continue
+        except:
+            pass
+        out.append(('after-try', i))
+    return out
+
+
+print(continue_in_try_skips_after())
+
+
+def break_in_try_exits_loop_immediately():
+    out = []
+    for i in range(5):
+        try:
+            if i == 2:
+                break
+        except:
+            pass
+        out.append(('after-try', i))
+    out.append('after-loop')
+    return out
+
+
+print(break_in_try_exits_loop_immediately())
+
+
+def continue_in_handler_skips_after():
+    out = []
+    for i in range(4):
+        try:
+            if i % 2 == 0:
+                raise ValueError('skip')
+        except ValueError:
+            continue
+        out.append(('after-try', i))
+    return out
+
+
+print(continue_in_handler_skips_after())
+
+
+def break_in_handler_exits_loop():
+    out = []
+    for i in range(5):
+        try:
+            if i == 2:
+                raise ValueError('stop')
+            out.append(('try', i))
+        except ValueError:
+            break
+        out.append(('after-try', i))
+    out.append('done')
+    return out
+
+
+print(break_in_handler_exits_loop())
+
+
+def continue_in_finally_skips_after():
+    out = []
+    for i in range(4):
+        try:
+            out.append(('try', i))
+            if i == 1:
+                raise ValueError
+        except ValueError:
+            pass
+        finally:
+            if i % 2 == 0:
+                continue
+        out.append(('after-try', i))
+    return out
+
+
+print(continue_in_finally_skips_after())
+
+
+def nested_try_break():
+    out = []
+    for i in range(5):
+        try:
+            try:
+                if i == 2:
+                    break
+            except:
+                pass
+            out.append(('inner-after-try', i))
+        except:
+            pass
+        out.append(('outer-after-try', i))
+    out.append('done')
+    return out
+
+
+print(nested_try_break())
+
+
+def while_with_continue_in_try():
+    out = []
+    n = 0
+    while n < 5:
+        n += 1
+        try:
+            if n % 2 == 0:
+                continue
+        except:
+            pass
+        out.append(('after-try', n))
+    return out
+
+
+print(while_with_continue_in_try())

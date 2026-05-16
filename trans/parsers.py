@@ -564,27 +564,68 @@ def make_loop_var_escape(target, frame) -> ast.expr:
     Python binds `i` after `for i in ...:` to the last iterated value
     (and leaves `i` unbound when the iterable was empty). The ListComp
     we rewrite to has its own scope, so we have to re-emit the binding
-    explicitly. We only handle simple Name targets; tuple-unpack targets
-    (`for a, b in ...`) silently keep the old non-leaking behavior.
+    explicitly.
 
-    The expression must always evaluate falsy so it doesn't short-circuit
-    the surrounding Or chain — even when last_yielded is a truthy value.
+    Supports plain Name targets and Tuple/List targets (`for a, b in
+    ...`). Starred targets (`for *a, b in ...`) fall back to no-op.
+
+    The expression must always evaluate falsy so it doesn't short-
+    circuit the surrounding Or chain — even when last_yielded is a
+    truthy value.
     """
-    if not isinstance(target, ast.Name):
-        # Fall back to a no-op (falsy) so it doesn't break the Or chain.
-        return ast.Constant(value=False)
     helper = ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load())
-    return ast.BoolOp(
-        op=ast.And(),
-        values=[
-            ast.Attribute(value=helper, attr='was_iterated', ctx=ast.Load()),
+    last_yielded = ast.Attribute(value=helper, attr='last_yielded', ctx=ast.Load())
+
+    if isinstance(target, ast.Name):
+        bind = ast.NamedExpr(
+            target=ast.Name(id=target.id, ctx=ast.Store()),
+            value=last_yielded,
+        )
+        return ast.BoolOp(
+            op=ast.And(),
+            values=[
+                ast.Attribute(value=helper, attr='was_iterated', ctx=ast.Load()),
+                bind,
+                ast.Constant(value=False),
+            ],
+        )
+
+    if isinstance(target, (ast.Tuple, ast.List)) and all(
+        isinstance(e, ast.Name) for e in target.elts
+    ):
+        # for a, b in ...: rebind each name from last_yielded[i].
+        # Use a tuple of walruses then take a falsy element so the
+        # whole expression stays falsy regardless of the bound values.
+        binds = [
             ast.NamedExpr(
-                target=ast.Name(id=target.id, ctx=ast.Store()),
-                value=ast.Attribute(value=helper, attr='last_yielded', ctx=ast.Load()),
+                target=ast.Name(id=elt.id, ctx=ast.Store()),
+                value=ast.Subscript(
+                    value=last_yielded,
+                    slice=ast.Constant(value=i),
+                    ctx=ast.Load(),
+                ),
+            )
+            for i, elt in enumerate(target.elts)
+        ]
+        bind_tuple = ast.Subscript(
+            value=ast.Tuple(
+                elts=binds + [ast.Constant(value=False)],
+                ctx=ast.Load(),
             ),
-            ast.Constant(value=False),
-        ],
-    )
+            slice=ast.Constant(value=-1),
+            ctx=ast.Load(),
+        )
+        return ast.BoolOp(
+            op=ast.And(),
+            values=[
+                ast.Attribute(value=helper, attr='was_iterated', ctx=ast.Load()),
+                bind_tuple,
+            ],
+        )
+
+    # Anything more exotic (Starred, nested unpacks) — give up and
+    # return a no-op falsy.
+    return ast.Constant(value=False)
 
 
 def make_return_propagator(frame: Frame) -> ast.expr:
@@ -948,6 +989,33 @@ def parse_try(stmt: ast.Try, frame: Frame) -> list[_ast.AST]:
     # that to the enclosing function's Or chain so the rest of the body
     # is short-circuited.
     stmts.append(make_return_propagator(frame))
+    # If the try clause did `break` or `continue`, the truthy return
+    # value of loop.stop() / loop.do_continue() was eaten at the per-
+    # clause lambda boundary. Re-surface those by reading the loop
+    # helper's flags. Both are emitted as plain expressions (returning
+    # truthy from the test short-circuits the enclosing for-body Or
+    # chain so the statements after this try don't run on this
+    # iteration). Only meaningful when the try sits inside a loop.
+    if frame.loops:
+        loop_var_ref = ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load())
+        stmts.append(
+            ast.BoolOp(
+                op=ast.And(),
+                values=[
+                    ast.Attribute(value=loop_var_ref, attr='stopped', ctx=ast.Load()),
+                    ast.Constant(value=True),
+                ],
+            )
+        )
+        stmts.append(
+            ast.BoolOp(
+                op=ast.And(),
+                values=[
+                    ast.Attribute(value=loop_var_ref, attr='pending_continue', ctx=ast.Load()),
+                    ast.Constant(value=True),
+                ],
+            )
+        )
     return stmts
 
 
@@ -1086,9 +1154,23 @@ def parse_break(_: ast.Break, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_continue(stmt: ast.Continue, frame: Frame) -> list[_ast.AST]:
-    # Use Constant instead of Expr to avoid adding "and False"
+    # Sets the loop helper's pending_continue flag and returns True.
+    # The truthy return value still short-circuits the surrounding Or
+    # chain (so `if cond: continue\nrest` skips `rest` for that
+    # iteration). The flag is what lets us cross lambda boundaries: a
+    # `continue` inside a try body lambda becomes invisible to the
+    # outer for-body Or chain unless something explicitly checks
+    # loop.pending_continue, which parse_try does.
     return [
-        ast.Constant(value=True),
+        ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load()),
+                attr='do_continue',
+                ctx=ast.Load(),
+            ),
+            args=[],
+            keywords=[],
+        )
     ]
 
 

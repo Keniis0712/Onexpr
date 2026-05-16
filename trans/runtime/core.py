@@ -38,11 +38,14 @@ class _ForHelper:
         self.func_helper = func_helper
         self.last_yielded = None
         self.was_iterated = False
+        self.pending_continue = False
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        # Reset per-iteration flags before checking termination.
+        self.pending_continue = False
         if self.func_helper.returned:
             self.stopped = True
         if self.stopped:
@@ -56,17 +59,23 @@ class _ForHelper:
         self.stopped = True
         return True
 
+    def do_continue(self):
+        self.pending_continue = True
+        return True
+
 
 class _WhileHelper:
     def __init__(self, func_helper):
         self.stopped = False
         self.ended = False
         self.func_helper = func_helper
+        self.pending_continue = False
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        self.pending_continue = False
         if self.func_helper.returned:
             self.stopped = True
         if self.stopped or self.ended:
@@ -75,6 +84,10 @@ class _WhileHelper:
 
     def stop(self):
         self.stopped = True
+        return True
+
+    def do_continue(self):
+        self.pending_continue = True
         return True
 
     def cond(self, condition):

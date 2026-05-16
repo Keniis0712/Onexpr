@@ -17,13 +17,21 @@ def parse_root(tree: ast.Module) -> ast.Module:
     super_trans = SuperTransformer()
     tree = super_trans.visit(tree)
 
+    # Allocate the module-level _FuncHelper var name before running
+    # the nonlocal pass — it needs to know the name in case there are
+    # top-level try clauses to box.
+    top_frame.func_helper_var = top_frame.get_temp_var()
+
     # Resolve `nonlocal`: walk the tree, find the owner function for
     # each declared name, and rewrite reads/writes to go through the
     # owner's box. Run before add_helper so the injected helper class
     # source isn't itself rewritten.
-    apply_nonlocal_pass(tree, top_frame.get_temp_var)
+    apply_nonlocal_pass(
+        tree,
+        top_frame.get_temp_var,
+        module_helper_var=top_frame.func_helper_var,
+    )
 
-    top_frame.func_helper_var = top_frame.get_temp_var()
     add_helper(tree, top_frame.func_helper_var)
 
     expr = parse_stmts(tree.body, top_frame)

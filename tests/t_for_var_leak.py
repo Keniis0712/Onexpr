@@ -154,3 +154,59 @@ def truthy_leak_does_not_kill_caller():
 
 
 truthy_leak_does_not_kill_caller()
+
+
+def tuple_unpack_leaks():
+    for a, b in [(1, 2), (3, 4), (5, 6)]:
+        pass
+    return (a, b)
+
+
+print(tuple_unpack_leaks())
+
+
+def list_unpack_leaks():
+    for [x, y] in [[10, 20], [30, 40]]:
+        pass
+    return (x, y)
+
+
+print(list_unpack_leaks())
+
+
+def tuple_unpack_after_break():
+    for a, b in [(1, 2), (3, 4), (5, 6), (7, 8)]:
+        if a == 5:
+            break
+    return (a, b)
+
+
+print(tuple_unpack_after_break())
+
+
+def tuple_unpack_empty_does_not_bind():
+    a, b = 'pre-a', 'pre-b'
+    for a, b in []:
+        pass
+    return (a, b)
+
+
+print(tuple_unpack_empty_does_not_bind())
+
+
+def enumerate_pattern():
+    for i, c in enumerate('xyz'):
+        pass
+    return (i, c)
+
+
+print(enumerate_pattern())
+
+
+def three_way_unpack():
+    for a, b, c in [(1, 2, 3), (4, 5, 6)]:
+        pass
+    return (a, b, c)
+
+
+print(three_way_unpack())

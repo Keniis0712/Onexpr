@@ -401,7 +401,7 @@ def _lambda_arg_names(args) -> set:
     return names
 
 
-def _rewrite(tree, boxed, helper_name_for):
+def _rewrite(tree, boxed, helper_name_for, module_boxed=frozenset(), module_helper_var=None):
     def visit(node, lookup):
         if node is None:
             return None
@@ -521,20 +521,33 @@ def _rewrite(tree, boxed, helper_name_for):
         return node
 
     def top_lookup(name):
+        if name in module_boxed:
+            return (module_helper_var, name)
         return None
 
     visit(tree, top_lookup)
 
 
-def apply_nonlocal_pass(tree, name_provider) -> None:
+def apply_nonlocal_pass(tree, name_provider, module_helper_var=None) -> None:
     """Rewrite `tree` in place so that nonlocal-targeted names go
     through their owner's box. `name_provider` is a zero-arg callable
     returning a fresh temp variable name; we use it to allocate a
-    helper-var name for each owner function."""
+    helper-var name for each owner function.
+
+    `module_helper_var`, if given, is the name of the module-level
+    _FuncHelper instance. We use it to box names assigned inside
+    top-level try clauses (each try clause becomes its own lambda, so
+    those assignments would otherwise be lost). Names declared global
+    are kept as plain global writes."""
     _annotate_bound_names(tree)
     boxed = _resolve_owners(tree)
 
-    if not boxed:
+    # Collect module-level try-clause assignments, if any.
+    module_boxed = set()
+    if module_helper_var is not None:
+        module_boxed = _collect_module_top_try_assigns(tree)
+
+    if not boxed and not module_boxed:
         return  # nothing to do
 
     helper_name = {}
@@ -546,4 +559,62 @@ def apply_nonlocal_pass(tree, name_provider) -> None:
             func_node._box_helper_var = helper_name[key]
         return helper_name[key]
 
-    _rewrite(tree, boxed, helper_name_for)
+    _rewrite(tree, boxed, helper_name_for, module_boxed, module_helper_var)
+
+
+def _collect_module_top_try_assigns(tree) -> set:
+    """Names assigned inside a try clause that sits directly in the
+    module body (not inside a function or class)."""
+    names = set()
+
+    class _Walker(ast.NodeVisitor):
+        # Reuse the same logic _ClauseWalker uses, but we can't share
+        # the closure cleanly so we inline a minimal version here.
+        def __init__(self):
+            self.in_try = 0
+
+        def visit_FunctionDef(self, node): pass
+        def visit_AsyncFunctionDef(self, node): pass
+        def visit_ClassDef(self, node): pass
+        def visit_Lambda(self, node): pass
+
+        def visit_Try(self, node):
+            self.in_try += 1
+            for s in node.body:
+                self.visit(s)
+            for s in node.orelse:
+                self.visit(s)
+            for s in node.finalbody:
+                self.visit(s)
+            for h in node.handlers:
+                for s in h.body:
+                    self.visit(s)
+            self.in_try -= 1
+
+        def _add_target(self, t):
+            if isinstance(t, ast.Name):
+                names.add(t.id)
+            elif isinstance(t, (ast.Tuple, ast.List)):
+                for e in t.elts:
+                    self._add_target(e)
+            elif isinstance(t, ast.Starred):
+                self._add_target(t.value)
+
+        def visit_Assign(self, node):
+            if self.in_try:
+                for t in node.targets:
+                    self._add_target(t)
+            self.generic_visit(node)
+
+        def visit_AugAssign(self, node):
+            if self.in_try:
+                self._add_target(node.target)
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node):
+            if self.in_try:
+                self._add_target(node.target)
+            self.generic_visit(node)
+
+    _Walker().visit(tree)
+    return names
