@@ -17,9 +17,38 @@ def add_deco(name: str, decorators: list[ast.expr], func: _ast.expr) -> ast.expr
     return node
 
 
+def slice_to_callable(key: ast.expr) -> ast.expr:
+    """If key is an ast.Slice, convert it to a slice(...) call so it can
+    be passed as a function argument (raw `1:3` syntax is only valid
+    inside subscript brackets)."""
+    if isinstance(key, ast.Slice):
+        return ast.Call(
+            func=ast.Name(id='slice', ctx=ast.Load()),
+            args=[
+                key.lower if key.lower is not None else ast.Constant(value=None),
+                key.upper if key.upper is not None else ast.Constant(value=None),
+                key.step if key.step is not None else ast.Constant(value=None),
+            ],
+            keywords=[],
+        )
+    return key
+
+
+def strip_arg_annotations(args: ast.arguments) -> None:
+    """Lambda doesn't accept annotated parameters; strip them in place."""
+    for group in (args.posonlyargs, args.args, args.kwonlyargs):
+        for a in group:
+            a.annotation = None
+    if args.vararg is not None:
+        args.vararg.annotation = None
+    if args.kwarg is not None:
+        args.kwarg.annotation = None
+
+
 def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
     temp_func_var = sub_frame.get_temp_var()
     helper_var = sub_frame.func_helper_var
+    strip_arg_annotations(stmt.args)
     body_or = parse_stmts(stmt.body, frame=sub_frame)
     lambda_body = ast.Subscript(
         value=ast.Tuple(
@@ -199,7 +228,62 @@ def parse_return(stmt: ast.Return, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_delete(stmt: ast.Delete, frame: Frame) -> list[_ast.AST]:
-    pass
+    out = []
+    for target in stmt.targets:
+        if isinstance(target, ast.Attribute):
+            # del obj.x -> delattr(obj, 'x')
+            out.append(ast.Expr(
+                value=ast.Call(
+                    func=ast.Name(id='delattr', ctx=ast.Load()),
+                    args=[
+                        target.value,
+                        ast.Constant(value=target.attr),
+                    ],
+                    keywords=[],
+                )
+            ))
+        elif isinstance(target, ast.Subscript):
+            # del obj[k] -> obj.__delitem__(k); slice key needs to be
+            # built explicitly because `1:3` syntax isn't valid as a
+            # call argument.
+            out.append(ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=target.value,
+                        attr='__delitem__',
+                        ctx=ast.Load(),
+                    ),
+                    args=[slice_to_callable(target.slice)],
+                    keywords=[],
+                )
+            ))
+        elif isinstance(target, ast.Name):
+            # del x: best-effort. Drop from globals() so module-level usage
+            # works. For names that live in a lambda's locals (function or
+            # class body) this is a silent no-op — the original `del`
+            # semantics around local NameError can't be reproduced inside
+            # an expression.
+            out.append(ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Call(
+                            func=ast.Name(id='globals', ctx=ast.Load()),
+                            args=[],
+                            keywords=[],
+                        ),
+                        attr='pop',
+                        ctx=ast.Load(),
+                    ),
+                    args=[
+                        ast.Constant(value=target.id),
+                        ast.Constant(value=None),
+                    ],
+                    keywords=[],
+                )
+            ))
+        else:
+            raise NotImplementedError(f"del target: {type(target).__name__}")
+    return out
 
 
 def parse_assign(stmt: ast.Assign, frame: Frame) -> list[_ast.AST]:
@@ -310,7 +394,7 @@ def parse_assign(stmt: ast.Assign, frame: Frame) -> list[_ast.AST]:
                             ctx=ast.Load(),
                         ),
                         args=[
-                            target.slice,
+                            slice_to_callable(target.slice),
                             stmt.value,
                         ],
                         keywords=[],
@@ -364,7 +448,13 @@ def parse_aug_assign(stmt: ast.AugAssign, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_ann_assign(stmt: ast.AnnAssign, frame: Frame) -> list[_ast.AST]:
-    pass
+    if stmt.value is None:
+        # `x: int` is a bare annotation. At runtime it's a no-op for the
+        # value (annotations land in __annotations__ but we ignore that).
+        return [ast.Constant(value=False)]
+    # `x: int = v` -> `x = v`. Drop the annotation; let parse_assign handle
+    # the rest (Name / Attribute / Subscript targets).
+    return [ast.Assign(targets=[stmt.target], value=stmt.value)]
 
 
 def parse_for(stmt: ast.For, frame: Frame) -> list[_ast.AST]:
