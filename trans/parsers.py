@@ -146,6 +146,96 @@ def parse_async_function_def(stmt: ast.AsyncFunctionDef, frame: Frame) -> list[_
     return None
 
 
+def _collect_class_body_names(body: list) -> list:
+    """Names that the user defines at class-body level (in source
+    order, deduped). Skips any nested function / class / lambda
+    bodies because those have their own scope. Used by
+    parse_class_def to build an explicit dict for the metaclass
+    instead of returning locals() (which would also include onexpr's
+    helper temps)."""
+    seen = set()
+    out = []
+
+    def add(name):
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+
+    def collect_target(t):
+        if isinstance(t, ast.Name):
+            add(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                collect_target(e)
+        elif isinstance(t, ast.Starred):
+            collect_target(t.value)
+
+    class _Walker(ast.NodeVisitor):
+        def visit_FunctionDef(self, node):
+            add(node.name)
+        def visit_AsyncFunctionDef(self, node):
+            add(node.name)
+        def visit_ClassDef(self, node):
+            add(node.name)
+        def visit_Lambda(self, node):
+            pass
+
+        def visit_Assign(self, node):
+            for t in node.targets:
+                collect_target(t)
+            self.visit(node.value)
+
+        def visit_AugAssign(self, node):
+            collect_target(node.target)
+            self.visit(node.value)
+
+        def visit_AnnAssign(self, node):
+            # Bare annotation `x: int` doesn't create a class
+            # attribute; only when there's an initializer.
+            if node.value is not None:
+                collect_target(node.target)
+                self.visit(node.value)
+
+        def visit_For(self, node):
+            collect_target(node.target)
+            self.visit(node.iter)
+            for s in node.body + node.orelse:
+                self.visit(s)
+
+        def visit_AsyncFor(self, node):
+            self.visit_For(node)
+
+        def visit_With(self, node):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    collect_target(item.optional_vars)
+                self.visit(item.context_expr)
+            for s in node.body:
+                self.visit(s)
+
+        def visit_AsyncWith(self, node):
+            self.visit_With(node)
+
+        def visit_ExceptHandler(self, node):
+            if node.name is not None:
+                add(node.name)
+            for s in node.body:
+                self.visit(s)
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                add(alias.asname if alias.asname else alias.name.split('.')[0])
+
+        def visit_ImportFrom(self, node):
+            for alias in node.names:
+                add(alias.asname if alias.asname else alias.name)
+
+    walker = _Walker()
+    for stmt in body:
+        walker.visit(stmt)
+    return out
+
+
 def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
     sub_frame = Frame(prev=frame, nonlocal_vars=[], global_vars=[])
     sub_frame.legacy_return = (
@@ -162,10 +252,10 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
     cls_body = stmt.body
 
     # If the nonlocal pass boxed any names assigned inside try clauses
-    # of this class body, those writes went to helper._b_<name>. The
-    # class namespace is built from `locals()`, so we reverse-copy each
-    # boxed name back into a regular local right before the locals()
-    # call so the namespace ends up with the right keys.
+    # of this class body, those writes went to helper._b_<name>. We
+    # reverse-copy each one into a regular local at the end of the
+    # body, before we extract the user namespace, so the namespace
+    # ends up with the right keys.
     class_boxed_names = getattr(stmt, '_class_boxed_names', None) or set()
     for name in sorted(class_boxed_names):
         cls_body.append(
@@ -179,15 +269,24 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
             )
         )
 
+    # Collect the names the user actually defined at class-body level
+    # so we can return them as an explicit dict instead of `locals()`.
+    # `locals()` would include all of onexpr's helper temps (the
+    # _FuncHelper instance, intermediate temp_N vars, etc.) and feeding
+    # those into a metaclass like Enum's would either trip its name
+    # validation or pollute the resulting class with garbage.
+    user_names = _collect_class_body_names(cls_body)
+
+    # Replace the trailing Return(locals()) with Return({name: name, ...}).
     cls_body.append(
         ast.Return(
-            value=ast.Call(
-                func=ast.Name(id='locals', ctx=ast.Load()),
-                args=[],
-                keywords=[],
+            value=ast.Dict(
+                keys=[ast.Constant(value=n) for n in user_names],
+                values=[ast.Name(id=n, ctx=ast.Load()) for n in user_names],
             )
         )
     )
+
     metaclass = ast.Name(id='type', ctx=ast.Load())
     for kwd in stmt.keywords:
         if kwd.arg == 'metaclass':
@@ -195,7 +294,6 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
             break
 
     if sub_frame.legacy_return:
-        # Legacy: body's Or chain ends with (locals(), True); take [0].
         body_or = parse_stmts(cls_body, frame=sub_frame)
         cls_lambda_body = ast.Subscript(
             value=body_or,
@@ -239,36 +337,79 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
             ctx=ast.Load(),
         )
 
+    # Build the metaclass instantiation. The runtime helper
+    # _make_class handles everything: picking the right metaclass
+    # (user override > most-derived from bases > type), running its
+    # __prepare__ to get the proper namespace, populating it from
+    # the body dict, and finally calling the metaclass.
+    #
+    # Internal helper classes (legacy_return mode) skip _make_class:
+    # _make_class itself lives in the same helper module, so calling
+    # it from there would be a forward reference. Plain
+    # type(name, bases, dict) is correct for them since they don't
+    # have custom metaclasses or weird namespace requirements.
+    if sub_frame.legacy_return:
+        body_call = ast.Call(
+            func=ast.Lambda(
+                args=ast.arguments(
+                    posonlyargs=[],
+                    args=[],
+                    vararg=None,
+                    kwonlyargs=[],
+                    kw_defaults=[],
+                    defaults=[],
+                ),
+                body=cls_lambda_body,
+            ),
+            args=[],
+            keywords=[],
+        )
+        construct = ast.Call(
+            func=metaclass,
+            args=[
+                ast.Constant(stmt.name),
+                ast.Tuple(elts=stmt.bases, ctx=ast.Load()),
+                body_call,
+            ],
+            keywords=[],
+        )
+        return [
+            ast.Assign(
+                targets=[ast.Name(id=stmt.name, ctx=ast.Store())],
+                value=add_deco(stmt.name, stmt.decorator_list, construct),
+            )
+        ]
+
+    body_call = ast.Call(
+        func=ast.Lambda(
+            args=ast.arguments(
+                posonlyargs=[],
+                args=[],
+                vararg=None,
+                kwonlyargs=[],
+                kw_defaults=[],
+                defaults=[],
+            ),
+            body=cls_lambda_body,
+        ),
+        args=[],
+        keywords=[],
+    )
+    construct = ast.Call(
+        func=ast.Name(id='_make_class', ctx=ast.Load()),
+        args=[
+            metaclass,
+            ast.Constant(stmt.name),
+            ast.Tuple(elts=list(stmt.bases), ctx=ast.Load()),
+            body_call,
+        ],
+        keywords=[],
+    )
+
     return [
         ast.Assign(
             targets=[ast.Name(id=stmt.name, ctx=ast.Store())],
-            value=add_deco(
-                stmt.name,
-                stmt.decorator_list,
-                ast.Call(
-                    func=metaclass,
-                    args=[
-                        ast.Constant(stmt.name),
-                        ast.Tuple(elts=stmt.bases, ctx=ast.Load()),
-                        ast.Call(
-                            func=ast.Lambda(
-                                args=ast.arguments(
-                                    posonlyargs=[],
-                                    args=[],
-                                    vararg=None,
-                                    kwonlyargs=[],
-                                    kw_defaults=[],
-                                    defaults=[],
-                                ),
-                                body=cls_lambda_body,
-                            ),
-                            args=[],
-                            keywords=[],
-                        ),
-                    ],
-                    keywords=[],
-                )
-            )
+            value=add_deco(stmt.name, stmt.decorator_list, construct),
         )
     ]
 

@@ -125,3 +125,33 @@ def _del_local(name):
     frame.f_locals[name] = None
     return None
 
+
+# Build a class the same way `class Foo(...)` does at the source
+# level. The user code's "lambda body returning a dict" path skips
+# the metaclass protocol entirely; this helper restores it:
+#   1. Pick the right metaclass — the user's explicit `metaclass=`
+#      wins; otherwise, take the most-derived metaclass among the
+#      bases (Python's standard rule).
+#   2. Call metaclass.__prepare__(name, bases) to obtain the
+#      namespace dict the metaclass wants. For Enum that returns an
+#      _EnumDict whose __setitem__ registers each member as it's set.
+#   3. Move the body's bindings into that namespace via update.
+#   4. Instantiate the class via the chosen metaclass.
+def _make_class(metaclass, name, bases, body_dict):
+    if metaclass is type and bases:
+        # If the user didn't write metaclass=..., derive it from the
+        # bases. Pick the most-derived; raise on incompatible siblings.
+        for b in bases:
+            mc = type(b)
+            if issubclass(mc, metaclass):
+                metaclass = mc
+            elif not issubclass(metaclass, mc):
+                raise TypeError(
+                    'metaclass conflict: the metaclass of a derived '
+                    'class must be a (non-strict) subclass of the '
+                    'metaclasses of all its bases'
+                )
+    ns = metaclass.__prepare__(name, bases)
+    ns.update(body_dict)
+    return metaclass(name, bases, ns)
+

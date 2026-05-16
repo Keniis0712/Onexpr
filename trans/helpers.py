@@ -73,13 +73,19 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
     # The try-helper runtime contains for-loops and while-loops, so
     # injecting it pulls in _ForHelper / _WhileHelper as a transitive
     # dependency. `with` also uses the try-helper (its with_block).
+    # _make_class also has a for-loop in its body (to walk bases),
+    # and we always inject _make_class.
     needs_try_runtime = (
         ast.Try in detector.presence
         or ast.TryStar in detector.presence
         or ast.With in detector.presence
         or ast.AsyncWith in detector.presence
     )
-    needs_for = ast.For in detector.presence or needs_try_runtime
+    needs_for = (
+        ast.For in detector.presence
+        or needs_try_runtime
+        or ast.ClassDef in detector.presence  # _make_class iterates bases
+    )
     needs_while = ast.While in detector.presence or needs_try_runtime
 
     # Pull in the three core helper classes; each is annotated for the
@@ -97,6 +103,10 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
         to_insert.append(core_by_name[while_helper_name])
     if ast.Delete in detector.presence and '_del_local' in core_by_name:
         to_insert.append(core_by_name['_del_local'])
+    # _make_class is needed by every ClassDef parse_class_def emits,
+    # including the helper classes we always inject. Always include it.
+    if '_make_class' in core_by_name:
+        to_insert.append(core_by_name['_make_class'])
 
     if ast.AsyncFunctionDef in detector.presence:
         to_insert.append(ast.Import(

@@ -306,21 +306,10 @@ print(case_named_constant())
 from enum import Enum
 
 
-class _ColorEnumStub:
-    # Enum needs metaclass.__prepare__ which onexpr doesn't honor —
-    # we'd hit AttributeError("'dict' object has no attribute
-    # '_member_names'"). Use a plain class with attributes that mimic
-    # enum member access for pattern matching.
-    pass
-
-
-class Color:
-    pass
-
-
-Color.RED = 'red'
-Color.GREEN = 'green'
-Color.BLUE = 'blue'
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 3
 
 
 def case_enum_value():
@@ -359,3 +348,19 @@ def case_match_in_function_with_capture():
 
 
 print(case_match_in_function_with_capture())
+
+
+def case_enum_iterable():
+    # Enum requires metaclass.__prepare__ to return _EnumDict;
+    # _make_class honors that.
+    return [c.name for c in Color]
+
+
+print(case_enum_iterable())
+
+
+def case_enum_value_lookup():
+    return Color(2).name
+
+
+print(case_enum_value_lookup())
