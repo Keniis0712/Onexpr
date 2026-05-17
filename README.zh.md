@@ -35,9 +35,13 @@ python obfuscated.py    # 跟原文件一样跑
 - `match` / `case`(PEP 634),所有 pattern + guard。
 - 生成器:`yield` / `yield from`、`send` / `throw` / `close`、
   `return value`、`try` / `with` 跨 `yield`、
-  `break` / `continue` / `return` 穿 `finally`。
+  `break` / `continue` / `return` 穿 `finally`、
+  `yield from` 透传 send / throw / close(PEP 380)。
 - async:`async def` / `await`、`async for`、`async with`、
-  async generator(yield 之间能 await)、async comprehension。
+  async generator(yield 之间能 await,且支持 `asend` / `athrow` /
+  `aclose`)、async comprehension。
+- `inspect.isgeneratorfunction` / `iscoroutinefunction` /
+  `isasyncgenfunction` 对转换后的函数返回正确结果。
 - PEP 695 类型参数:`type X = ...`、`def f[T](...)`、`class C[T]:`、
   `ParamSpec`、`TypeVarTuple`、PEP 696 默认值。
 - 导入、`del`、`assert`、运行时注解、`:=`、复合赋值、星号解包。
@@ -49,11 +53,17 @@ python obfuscated.py    # 跟原文件一样跑
 - `for *a, b in ...`(目标里有星号)的循环变量不会逃逸到外层。
 - async 推导式只支持出现在赋值右侧或 `return` 顶层——不支持嵌在更大
   表达式里。
+- `inspect.isasyncgen(instance)` 对我们的 async-generator 实例返回
+  `False`——它检查的是 `isinstance(obj, types.AsyncGeneratorType)`,
+  那是具体 C 类型,我们的 wrapper 不是。
+  `inspect.isasyncgenfunction(forwarder)` 通过 `_has_code_flag` patch
+  工作。
 - 我们把 `typing.TypeAliasType` 替换成 ABC proxy,
   `isinstance(x, typing.TypeAliasType)` 对真 C 实例和我们自己的 duck
   实例都工作。副作用:`type(x) is typing.TypeAliasType` 变 `False`,
   且替换是**进程级**的——混淆模块被普通程序 import 时该程序的 typing
-  也会被改。
+  也会被改。`inspect._has_code_flag` 的 patch 在用户代码含 async
+  generator 时同样进程级注入。
 
 ## 工作原理
 
@@ -100,6 +110,7 @@ trans/                 转换流水线
     core.py              _FuncHelper / _ForHelper / _WhileHelper / async 辅助
     try_helper.py        _TryHelper + 可重入事件循环子类
     typealias.py         _LazyAlias + typing.TypeAliasType proxy
+    inspect_patch.py     inspect._has_code_flag monkey-patch
 tests/
   t_*.py                 round-trip fixture
   test.py                unittest 入口

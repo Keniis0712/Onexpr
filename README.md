@@ -38,9 +38,13 @@ Most modern Python:
 - `match` / `case` (PEP 634), all pattern kinds plus guards.
 - Generators: `yield` / `yield from`, `send` / `throw` / `close`,
   `return value`, `try` / `with` crossing `yield`,
-  `break` / `continue` / `return` through `finally`.
+  `break` / `continue` / `return` through `finally`. PEP 380 send /
+  throw / close forwarding through `yield from`.
 - async: `async def` / `await`, `async for`, `async with`, async
-  generators (with `await` between yields), async comprehensions.
+  generators (with `await` between yields plus `asend` / `athrow` /
+  `aclose`), async comprehensions.
+- `inspect.isgeneratorfunction` / `iscoroutinefunction` /
+  `isasyncgenfunction` recognise transformed functions.
 - PEP 695 type parameters: `type X = ...`, `def f[T](...)`,
   `class C[T]:`, `ParamSpec`, `TypeVarTuple`, PEP 696 defaults.
 - Imports, `del`, `assert`, runtime annotations, `:=`, augmented
@@ -55,11 +59,18 @@ Most modern Python:
   let `a` / `b` escape the loop.
 - async comprehensions only work as the right-hand side of an
   assignment or a `return` — not nested inside a larger expression.
+- `inspect.isasyncgen(instance)` returns `False` for our async-generator
+  instances. The check uses `isinstance(obj, types.AsyncGeneratorType)`
+  with a concrete C type, and our wrapper class isn't that type.
+  `inspect.isasyncgenfunction(forwarder)` does work via the
+  `_has_code_flag` patch.
 - We replace `typing.TypeAliasType` with an ABC proxy so
   `isinstance(x, typing.TypeAliasType)` keeps working for both real C
   instances and our duck instances. Side effect:
   `type(x) is typing.TypeAliasType` becomes `False`, and the swap is
-  process-wide if the obfuscated code is imported as a library.
+  process-wide if the obfuscated code is imported as a library. The
+  same is true for the `inspect._has_code_flag` patch we install when
+  the user code uses async generators.
 
 ## How it works
 
@@ -109,6 +120,7 @@ trans/                 transformation pipeline
     core.py              _FuncHelper / _ForHelper / _WhileHelper / async helpers
     try_helper.py        _TryHelper + reentrant event-loop subclass
     typealias.py         _LazyAlias + typing.TypeAliasType proxy
+    inspect_patch.py     inspect._has_code_flag monkey-patch
 tests/
   t_*.py                 round-trip fixtures
   test.py                unittest entry point
