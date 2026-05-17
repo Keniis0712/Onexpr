@@ -879,3 +879,40 @@ def gen_global():
 
 
 print(gen_global())
+
+
+# Regression: PEP 479 — `raise StopIteration` (and friends) inside a
+# generator body should escape as RuntimeError ("generator raised
+# StopIteration"), not silently terminate iteration. Distinguished
+# from `return` via self._stopping_via_return.
+def gen_pep479_raise():
+    def g():
+        yield 1
+        raise StopIteration('forbidden')
+
+    try:
+        list(g())
+    except RuntimeError:
+        return 'caught'
+    return 'leaked'
+
+
+print(gen_pep479_raise())
+
+
+# Regression: generator with raise StopIteration inside a for-loop in
+# the body — same PEP 479 path through the body's _emit_terminator.
+def gen_pep479_inloop():
+    def g():
+        for i in range(5):
+            if i == 2:
+                raise StopIteration
+            yield i
+
+    try:
+        return list(g())
+    except RuntimeError:
+        return 'caught'
+
+
+print(gen_pep479_inloop())

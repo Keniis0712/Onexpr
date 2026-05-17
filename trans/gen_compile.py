@@ -1526,6 +1526,16 @@ class _CFGBuilder:
                             comparators=[ast.Constant(value='return')],
                         ),
                         body=[
+                            # PEP 479 marker: this StopIteration is from
+                            # `return` (routed through finally), not a
+                            # user-level raise.
+                            ast.Assign(
+                                targets=[ast.Attribute(
+                                    value=_self_name(ast.Load()),
+                                    attr='_stopping_via_return', ctx=ast.Store(),
+                                )],
+                                value=ast.Constant(value=True),
+                            ),
                             ast.Raise(
                                 exc=ast.Call(
                                     func=ast.Name(id='StopIteration', ctx=ast.Load()),
@@ -1811,6 +1821,19 @@ def emit_state_machine(
                 attr='_yfrom', ctx=ast.Store(),
             )],
             value=ast.Constant(value=None),
+        )
+    )
+    # _stopping_via_return: True iff the StopIteration that's about
+    # to escape send() came from `return` or fall-off-end (PEP 479).
+    # User-level `raise StopIteration(...)` leaves this False so the
+    # send wrapper can convert it to RuntimeError.
+    init_body.append(
+        ast.Assign(
+            targets=[ast.Attribute(
+                value=ast.Name(id=init_self, ctx=ast.Load()),
+                attr='_stopping_via_return', ctx=ast.Store(),
+            )],
+            value=ast.Constant(value=False),
         )
     )
 
@@ -2691,6 +2714,49 @@ def _emit_send(blocks: list) -> ast.FunctionDef:
         keywords=[],
     )
     except_body = [
+        # PEP 479: if a StopIteration escapes from inside the user
+        # body (not from one of our injected return / fall-off-end
+        # paths), convert it to RuntimeError. CPython does this in
+        # the generator frame; we approximate with a flag set
+        # immediately before the synthetic StopIteration we emit
+        # for `return`.
+        ast.If(
+            test=ast.BoolOp(
+                op=ast.And(),
+                values=[
+                    ast.Call(
+                        func=ast.Name(id='isinstance', ctx=ast.Load()),
+                        args=[
+                            ast.Name(id='_e', ctx=ast.Load()),
+                            ast.Name(id='StopIteration', ctx=ast.Load()),
+                        ],
+                        keywords=[],
+                    ),
+                    ast.UnaryOp(
+                        op=ast.Not(),
+                        operand=ast.Attribute(
+                            value=_self_name(ast.Load()),
+                            attr='_stopping_via_return', ctx=ast.Load(),
+                        ),
+                    ),
+                ],
+            ),
+            body=[
+                ast.Raise(
+                    exc=ast.Call(
+                        func=ast.Name(id='RuntimeError', ctx=ast.Load()),
+                        args=[
+                            ast.Constant(
+                                value='generator raised StopIteration'
+                            ),
+                        ],
+                        keywords=[],
+                    ),
+                    cause=ast.Name(id='_e', ctx=ast.Load()),
+                ),
+            ],
+            orelse=[],
+        ),
         # self._exc = e
         ast.Assign(
             targets=[
@@ -2750,11 +2816,47 @@ def _emit_send(blocks: list) -> ast.FunctionDef:
             )
         ]
     else:
-        # No user try in body — exceptions just propagate out of send.
-        # Skipping the outer try keeps onexpr from compiling it through
-        # _TryHelper.dispatch, which would otherwise instantiate an
-        # event loop and interfere with user asyncio code.
-        while_body = while_inner
+        # No user try in body — but we still need to convert a
+        # user-level `raise StopIteration` into RuntimeError per
+        # PEP 479. Wrap with a narrow try that only catches
+        # StopIteration; everything else (including GeneratorExit
+        # from close()) propagates out of send naturally.
+        pep479_handler = [
+            ast.If(
+                test=ast.UnaryOp(
+                    op=ast.Not(),
+                    operand=ast.Attribute(
+                        value=_self_name(ast.Load()),
+                        attr='_stopping_via_return', ctx=ast.Load(),
+                    ),
+                ),
+                body=[
+                    ast.Raise(
+                        exc=ast.Call(
+                            func=ast.Name(id='RuntimeError', ctx=ast.Load()),
+                            args=[ast.Constant(value='generator raised StopIteration')],
+                            keywords=[],
+                        ),
+                        cause=ast.Name(id='_e', ctx=ast.Load()),
+                    ),
+                ],
+                orelse=[ast.Raise(exc=None, cause=None)],
+            ),
+        ]
+        while_body = [
+            ast.Try(
+                body=while_inner,
+                handlers=[
+                    ast.ExceptHandler(
+                        type=ast.Name(id='StopIteration', ctx=ast.Load()),
+                        name='_e',
+                        body=pep479_handler,
+                    ),
+                ],
+                orelse=[],
+                finalbody=[],
+            )
+        ]
 
     body = [
         # self._sent = sent
@@ -3009,6 +3111,15 @@ def _emit_terminator(t, blocks) -> list:
         ]
     if isinstance(t, TReturn):
         return [
+            # Mark this StopIteration as "from return / fall-off-end"
+            # so PEP 479 doesn't turn it into RuntimeError.
+            ast.Assign(
+                targets=[ast.Attribute(
+                    value=_self_name(ast.Load()),
+                    attr='_stopping_via_return', ctx=ast.Store(),
+                )],
+                value=ast.Constant(value=True),
+            ),
             ast.Raise(
                 exc=ast.Call(
                     func=ast.Name(id='StopIteration', ctx=ast.Load()),
@@ -3020,6 +3131,13 @@ def _emit_terminator(t, blocks) -> list:
         ]
     if isinstance(t, TEnd):
         return [
+            ast.Assign(
+                targets=[ast.Attribute(
+                    value=_self_name(ast.Load()),
+                    attr='_stopping_via_return', ctx=ast.Store(),
+                )],
+                value=ast.Constant(value=True),
+            ),
             ast.Raise(
                 exc=ast.Call(
                     func=ast.Name(id='StopIteration', ctx=ast.Load()),
