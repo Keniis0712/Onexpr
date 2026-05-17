@@ -152,6 +152,21 @@ class _ANFLifter(ast.NodeTransformer):
         )
         return ast.Name(id=tmp, ctx=ast.Load())
 
+    def visit_NamedExpr(self, node):
+        # Walrus inside an expression:
+        #     ... (x := expr) ...
+        # We don't lift it to a separate Assign because that would
+        # break short-circuit semantics: a walrus in an `if` test or
+        # `while` test gets re-evaluated each iteration, but a lifted
+        # Assign before the loop fires only once. Instead we tell the
+        # state-machine self-rewriter to leave both the target Name
+        # and any references to that name alone, by treating the
+        # walrus target as a send-local rather than a self.<name>
+        # box. collect_user_locals already skips NamedExpr, so the
+        # name simply isn't boxed and the walrus stays as-is.
+        node.value = self.visit(node.value)
+        return node
+
     def visit_Lambda(self, node):
         return node  # don't descend
 
@@ -233,11 +248,50 @@ def anf_transform(body: list, name_provider) -> list:
         return lifter._prefix + [new_stmt]
 
     for stmt in body:
+        if isinstance(stmt, ast.Match):
+            # Flatten match → subj-Assign + if/elif chain so the state
+            # machine sees only constructs it knows. compile_match's
+            # output uses walrus operators inside the test expressions
+            # for capture; those have short-circuit semantics that
+            # would break if we lifted them, so we mark the produced
+            # Ifs as match-origin and skip the lift step on them.
+            from .match_patterns import compile_match
+            fake_frame = _MiniFrame(name_provider)
+            flat = compile_match(stmt, fake_frame)
+            _mark_match_origin(flat)
+            out.extend(anf_transform(flat, name_provider))
+            continue
+
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            # Don't touch — has its own scope.
+            # Nested def/class: treat the bound name like any other
+            # user local. The def's own body has its own scope and
+            # goes through the regular onexpr path inside the state-
+            # machine class, so we don't descend.
+            #
+            # Emit `<name> = <name>` with the RHS Name marked so the
+            # state-machine self-rewriter doesn't rewrite it. After
+            # rewrite the LHS becomes `self.<name>` while the RHS
+            # stays as the send-local `<name>` produced by the def
+            # itself. The binding survives across state transitions.
             out.append(stmt)
+            rhs = ast.Name(id=stmt.name, ctx=ast.Load())
+            rhs._gen_no_self = True
+            out.append(
+                ast.Assign(
+                    targets=[ast.Name(id=stmt.name, ctx=ast.Store())],
+                    value=rhs,
+                )
+            )
             continue
         if isinstance(stmt, ast.If):
+            if getattr(stmt, '_from_match', False):
+                # Match-origin If: recurse into bodies but don't lift
+                # the test, which contains short-circuit walrus
+                # captures we must preserve.
+                stmt.body = anf_transform(stmt.body, name_provider)
+                stmt.orelse = anf_transform(stmt.orelse, name_provider)
+                out.append(stmt)
+                continue
             stmt.body = anf_transform(stmt.body, name_provider)
             stmt.orelse = anf_transform(stmt.orelse, name_provider)
             out.extend(lift(stmt))
@@ -256,6 +310,37 @@ def anf_transform(body: list, name_provider) -> list:
         out.extend(lift(stmt))
 
     return out
+
+
+class _MiniFrame:
+    """Adapter so compile_match (which expects a Frame-like object with
+    get_temp_var) can be called from the generator pipeline."""
+
+    def __init__(self, name_provider):
+        self.get_temp_var = name_provider
+
+
+def _mark_match_origin(nodes):
+    """Tag every If statement reachable from these nodes (without
+    crossing nested function/class/lambda scopes) as match-origin so
+    anf_transform skips lifting their tests."""
+
+    class _M(ast.NodeVisitor):
+        def visit_If(self, node):
+            node._from_match = True
+            for s in node.body:
+                self.visit(s)
+            for s in node.orelse:
+                self.visit(s)
+
+        def visit_FunctionDef(self, node): pass
+        def visit_AsyncFunctionDef(self, node): pass
+        def visit_ClassDef(self, node): pass
+        def visit_Lambda(self, node): pass
+
+    m = _M()
+    for n in nodes:
+        m.visit(n)
 
 
 # ---------------------------------------------------------------------
@@ -328,6 +413,14 @@ def collect_user_locals(body: list, args: ast.arguments) -> set:
                 # accidentally box that name.
                 if isinstance(node.ctx, (ast.Store, ast.Del)):
                     names.add(node.id)
+
+        def visit_NamedExpr(self, node):
+            # Walrus targets are NOT boxed: the walrus stays as a
+            # send-local, because Python doesn't allow walrus on
+            # attribute targets (`(self.x := v)` is a SyntaxError).
+            # Only descend into the value side so any nested
+            # assignments / for targets in there still get collected.
+            self.visit(node.value)
 
         def visit_Import(self, node):
             for alias in node.names:
@@ -608,12 +701,20 @@ class _SelfRewriter(ast.NodeTransformer):
         self.boxed = boxed
 
     def visit_Name(self, node):
+        if getattr(node, '_gen_no_self', False):
+            return node
         if node.id in self.boxed:
             return ast.Attribute(
                 value=ast.Name(id='self', ctx=ast.Load()),
                 attr=node.id,
                 ctx=node.ctx,
             )
+        return node
+
+    def visit_NamedExpr(self, node):
+        # Walrus: leave the target Name as a send-local (Python rejects
+        # walrus into an attribute), only rewrite Names inside .value.
+        node.value = self.visit(node.value)
         return node
 
     def visit_Lambda(self, node):

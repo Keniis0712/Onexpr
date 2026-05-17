@@ -154,3 +154,81 @@ def gen_loop_then_yield():
 
 
 print(list(gen_loop_then_yield()))
+
+
+def gen_with_match():
+    for x in range(5):
+        match x % 3:
+            case 0:
+                yield ('zero', x)
+            case 1:
+                yield ('one', x)
+            case _:
+                yield ('other', x)
+
+
+print(list(gen_with_match()))
+
+
+def gen_with_match_capture():
+    for x in [(1, 2), (3, 4), (5, 6)]:
+        match x:
+            case (a, b):
+                yield a + b
+
+
+print(list(gen_with_match_capture()))
+
+
+def gen_with_match_guard():
+    for x in range(10):
+        match x:
+            case n if n % 2 == 0:
+                yield ('even', n)
+            case n:
+                yield ('odd', n)
+
+
+print(list(gen_with_match_guard()))
+
+
+def gen_with_nested_def():
+    def helper(x):
+        return x * 2
+
+    for i in range(3):
+        yield helper(i)
+
+
+print(list(gen_with_nested_def()))
+
+
+def gen_with_nested_class():
+    class Pair:
+        def __init__(self, a, b):
+            self.a, self.b = a, b
+
+    for i in range(3):
+        p = Pair(i, i * 2)
+        yield (p.a, p.b)
+
+
+print(list(gen_with_nested_class()))
+
+
+def gen_with_walrus():
+    items = iter([1, 2, 3, None, 4])
+    while (chunk := next(items)) is not None:
+        yield chunk
+
+
+print(list(gen_with_walrus()))
+
+
+def gen_with_walrus_in_if():
+    for i in range(6):
+        if (sq := i * i) > 4:
+            yield sq
+
+
+print(list(gen_with_walrus_in_if()))
