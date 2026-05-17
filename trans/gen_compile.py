@@ -1984,10 +1984,24 @@ def emit_state_machine(
     # inspect._is_coroutine_mark.
     if async_kind == 'gen':
         # Async generator function. inspect.isasyncgenfunction queries
-        # CO_ASYNC_GENERATOR which we can't synthesize on a lambda, so
-        # this stays a known limitation. We do still set the
-        # asyncgen marker dunder some libraries look at first.
-        pass
+        # CO_ASYNC_GENERATOR (0x200), which a lambda can't acquire.
+        # The runtime monkey-patch on inspect._has_code_flag (injected
+        # via inspect_patch.py when the tree contains async generators)
+        # consults _onexpr_code_flags first, so advertising 0x200 here
+        # makes inspect.isasyncgenfunction(forwarder) return True.
+        set_name_stmts.append(
+            ast.Assign(
+                targets=[
+                    ast.Attribute(
+                        value=ast.Name(id=name, ctx=ast.Load()),
+                        attr='_onexpr_code_flags',
+                        ctx=ast.Store(),
+                    ),
+                ],
+                # 0x200 == inspect.CO_ASYNC_GENERATOR
+                value=ast.Constant(value=0x200),
+            )
+        )
     elif async_kind == 'coro':
         set_name_stmts.append(
             ast.If(

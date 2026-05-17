@@ -204,3 +204,14 @@ import inspect
 
 print(inspect.isgeneratorfunction(gen))
 print(inspect.iscoroutinefunction(coro))
+
+
+# Regression: inspect.isasyncgenfunction works for our async generator
+# forwarders via the inspect._has_code_flag monkey-patch.
+async def ag_for_inspect():
+    yield 1
+
+
+print(inspect.isasyncgenfunction(ag_for_inspect))
+print(inspect.isasyncgenfunction(coro))   # async non-generator: False
+print(inspect.isasyncgenfunction(gen))    # plain generator: False

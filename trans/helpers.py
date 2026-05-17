@@ -28,6 +28,10 @@ def _get_typealias_body() -> list:
     return _load_runtime_module('typealias.py')
 
 
+def _get_inspect_patch_body() -> list:
+    return _load_runtime_module('inspect_patch.py')
+
+
 def _has_pep695(tree: ast.AST) -> bool:
     """True iff the tree uses PEP 695 syntax: `type X = ...`,
     `def f[T](...)`, or `class C[T]:`."""
@@ -292,5 +296,12 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
 
     if _has_pep695(tree):
         to_insert = to_insert + _get_typealias_body()
+
+    # The inspect monkey-patch only exists to make
+    # inspect.isasyncgenfunction recognise our async-generator
+    # forwarders. Skip the cost when there's no async generator in the
+    # tree.
+    if _has_async_generator(tree):
+        to_insert = to_insert + _get_inspect_patch_body()
 
     tree.body = to_insert + tree.body
