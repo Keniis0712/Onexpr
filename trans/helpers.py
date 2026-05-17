@@ -119,6 +119,10 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
         or ast.TryStar in detector.presence
         or ast.With in detector.presence
         or ast.AsyncWith in detector.presence
+        # Generator state machines wrap their dispatch in a
+        # try/except so user except clauses inside a generator body
+        # can dispatch on caught exceptions.
+        or _has_generator_function(tree)
     )
     # _make_class is always injected (it instantiates every emitted
     # ClassDef, including the helpers themselves and the generator

@@ -422,3 +422,147 @@ def gen_try_finally_no_yield():
 
 
 list(gen_try_finally_no_yield())
+
+
+def gen_try_yield_in_body():
+    for x in (1, 2, 3):
+        try:
+            if x == 2:
+                raise ValueError('mid')
+            yield x
+        except ValueError as e:
+            yield ('caught', str(e))
+
+
+print(list(gen_try_yield_in_body()))
+
+
+def gen_try_finally_yield():
+    try:
+        yield 1
+    finally:
+        yield 'fin'
+    yield 2
+
+
+print(list(gen_try_finally_yield()))
+
+
+def gen_try_except_finally():
+    log = []
+    try:
+        yield 1
+        raise ValueError('mid')
+    except ValueError:
+        log.append('caught')
+        yield 'caught-yield'
+    finally:
+        log.append('fin')
+        yield 'fin-yield'
+    yield ('log', log)
+
+
+print(list(gen_try_except_finally()))
+
+
+def gen_nested_try_finally():
+    log = []
+    try:
+        try:
+            yield 1
+            raise ValueError('inner')
+        finally:
+            log.append('inner-fin')
+    except ValueError:
+        log.append('outer-caught')
+        yield 'caught'
+    yield ('log', log)
+
+
+print(list(gen_nested_try_finally()))
+
+
+def gen_with_yield_in_body():
+    class CM:
+        def __enter__(self):
+            return 'inside'
+
+        def __exit__(self, *a):
+            return False
+
+    with CM() as v:
+        yield v
+        yield 'after'
+
+
+print(list(gen_with_yield_in_body()))
+
+
+def gen_sequential_withs():
+    log = []
+
+    class CM:
+        def __init__(self, name):
+            self.name = name
+
+        def __enter__(self):
+            log.append(('enter', self.name))
+            return self.name
+
+        def __exit__(self, *a):
+            log.append(('exit', self.name))
+            return False
+
+    with CM('a') as v:
+        yield v
+        yield 'after-a'
+    with CM('b') as v:
+        yield v
+    yield ('log', log)
+
+
+print(list(gen_sequential_withs()))
+
+
+def gen_with_suppresses():
+    log = []
+
+    class CM:
+        def __init__(self, swallow):
+            self.swallow = swallow
+
+        def __enter__(self):
+            log.append('enter')
+            return 'inside'
+
+        def __exit__(self, *a):
+            log.append('exit')
+            return self.swallow
+
+    with CM(swallow=True) as v:
+        yield v
+        raise ValueError('boom')
+    yield ('past', log)
+
+
+print(list(gen_with_suppresses()))
+
+
+def gen_throw_into_try():
+    def gen():
+        try:
+            yield 1
+        except ValueError as e:
+            yield ('caught', str(e))
+
+    g = gen()
+    out = [next(g)]
+    out.append(g.throw(ValueError('thrown')))
+    try:
+        out.append(next(g))
+    except StopIteration:
+        out.append('stopped')
+    return out
+
+
+print(gen_throw_into_try())
