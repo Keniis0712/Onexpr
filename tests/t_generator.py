@@ -374,3 +374,51 @@ def gen_closure_over_local():
 
 
 print(gen_closure_over_local())
+
+
+def gen_try_no_yield():
+    for x in (1, 2, 3):
+        try:
+            v = 10 // (x - 2)
+        except ZeroDivisionError:
+            v = 'err'
+        yield (x, v)
+
+
+print(list(gen_try_no_yield()))
+
+
+class _CM:
+    def __enter__(self):
+        return 'inside'
+
+    def __exit__(self, *a):
+        return False
+
+
+def gen_with_no_yield():
+    for i in range(3):
+        with _CM() as v:
+            x = (i, v)
+        yield x
+
+
+print(list(gen_with_no_yield()))
+
+
+def gen_try_finally_no_yield():
+    log = []
+    for x in range(3):
+        try:
+            log.append(('try', x))
+            if x == 2:
+                raise ValueError('two')
+        except ValueError:
+            log.append(('caught', x))
+        finally:
+            log.append(('fin', x))
+        yield x
+    print('log:', log)
+
+
+list(gen_try_finally_no_yield())
