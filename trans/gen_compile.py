@@ -356,6 +356,13 @@ def anf_transform(body: list, name_provider, all_locals=None) -> list:
         if isinstance(stmt, ast.Try):
             stmt.body = anf_transform(stmt.body, name_provider, all_locals)
             for h in stmt.handlers:
+                if h.name is None:
+                    # Bare `except E:` — give it a synthetic name so
+                    # bare `raise` inside the handler can refer to it
+                    # (parse_raise on the send method has no exc stack
+                    # because it's a fresh function frame).
+                    h.name = name_provider()
+                _rewrite_bare_raise_to_named(h.body, h.name)
                 h.body = anf_transform(h.body, name_provider, all_locals)
             stmt.orelse = anf_transform(stmt.orelse, name_provider, all_locals)
             stmt.finalbody = anf_transform(stmt.finalbody, name_provider, all_locals)
@@ -372,6 +379,42 @@ def anf_transform(body: list, name_provider, all_locals=None) -> list:
         out.extend(lift(stmt))
 
     return out
+
+
+def _rewrite_bare_raise_to_named(body: list, name: str):
+    """In-place: every bare `raise` (no exc) in `body` becomes
+    `raise <name>`. Doesn't descend into nested function/class/lambda
+    or into another except handler (which would have its own name to
+    bind to)."""
+    class _R(ast.NodeTransformer):
+        def visit_Raise(self, node):
+            if node.exc is None:
+                return ast.Raise(
+                    exc=ast.Name(id=name, ctx=ast.Load()),
+                    cause=node.cause,
+                )
+            return node
+
+        def visit_FunctionDef(self, node): return node
+        def visit_AsyncFunctionDef(self, node): return node
+        def visit_ClassDef(self, node): return node
+        def visit_Lambda(self, node): return node
+        def visit_Try(self, node):
+            # Body and finally still see this name as the active
+            # exception. except handlers shadow with their own name
+            # (bare raise inside a nested handler refers to that
+            # nested except's exception, not ours).
+            node.body = [self.visit(s) for s in node.body]
+            node.orelse = [self.visit(s) for s in node.orelse]
+            node.finalbody = [self.visit(s) for s in node.finalbody]
+            # Don't descend into node.handlers — they re-enter
+            # _rewrite_bare_raise_to_named with their own name in the
+            # outer pass.
+            return node
+
+    r = _R()
+    for i, s in enumerate(body):
+        body[i] = r.visit(s)
 
 
 def _lower_with_to_try(stmt: ast.With, name_provider) -> list:
@@ -718,6 +761,34 @@ class _CFGBuilder:
                 break
         return current
 
+    def _innermost_finally(self):
+        """Return the topmost try_stack entry that has a finally (so
+        break/continue/return inside the try body must run that
+        finally before reaching their target). None if there's no
+        active try with finally."""
+        for entry in reversed(self.try_stack):
+            if entry.get('finally_entry') is not None:
+                return entry
+        return None
+
+    def _innermost_finally_in_loop(self):
+        """Like _innermost_finally, but only returns entries that were
+        pushed *inside* the current innermost loop. break/continue
+        only need to detour through finallies that sit between them
+        and the loop exit."""
+        if not self.loop_stack:
+            return None
+        loop_idx = len(self.loop_stack) - 1
+        for entry in reversed(self.try_stack):
+            if entry.get('finally_entry') is None:
+                continue
+            if entry.get('loop_depth_at_push', -1) < loop_idx:
+                # The finally is outside the current loop — break /
+                # continue exit the loop without going through it.
+                return None
+            return entry
+        return None
+
     def _emit_one(self, stmt, current: Block) -> Block:
         if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Yield):
             return self._emit_yield(stmt.value.value, None, current)
@@ -736,6 +807,40 @@ class _CFGBuilder:
                 stmt.value.value, stmt.targets[0].id, current,
             )
         if isinstance(stmt, ast.Return):
+            fin = self._innermost_finally()
+            if fin is not None:
+                # Stash the return value on self.<outcome>_value, set
+                # outcome=return, jump to finally. The finally's
+                # outcome router will re-emit a TReturn after running.
+                outcome = fin['outcome_attr']
+                value_attr = outcome + '_retval'
+                ret_val = (stmt.value if stmt.value is not None
+                           else ast.Constant(value=None))
+                current.stmts.append(
+                    ast.Assign(
+                        targets=[
+                            ast.Attribute(
+                                value=_self_name(ast.Load()),
+                                attr=value_attr, ctx=ast.Store(),
+                            )
+                        ],
+                        value=ret_val,
+                    )
+                )
+                fin.setdefault('uses_return', True)
+                current.stmts.append(
+                    ast.Assign(
+                        targets=[
+                            ast.Attribute(
+                                value=_self_name(ast.Load()),
+                                attr=outcome, ctx=ast.Store(),
+                            )
+                        ],
+                        value=ast.Constant(value='return'),
+                    )
+                )
+                current.terminator = TGoto(target=fin['finally_entry'])
+                return current
             current.terminator = TReturn(
                 value=stmt.value if stmt.value is not None else ast.Constant(value=None)
             )
@@ -750,12 +855,44 @@ class _CFGBuilder:
             if not self.loop_stack:
                 raise SyntaxError("'break' outside loop")
             _cont, brk = self.loop_stack[-1]
+            fin = self._innermost_finally_in_loop()
+            if fin is not None:
+                fin.setdefault('uses_break', set()).add(brk)
+                current.stmts.append(
+                    ast.Assign(
+                        targets=[
+                            ast.Attribute(
+                                value=_self_name(ast.Load()),
+                                attr=fin['outcome_attr'], ctx=ast.Store(),
+                            )
+                        ],
+                        value=ast.Constant(value=f'break:{brk}'),
+                    )
+                )
+                current.terminator = TGoto(target=fin['finally_entry'])
+                return current
             current.terminator = TGoto(target=brk)
             return current
         if isinstance(stmt, ast.Continue):
             if not self.loop_stack:
                 raise SyntaxError("'continue' outside loop")
             cont, _brk = self.loop_stack[-1]
+            fin = self._innermost_finally_in_loop()
+            if fin is not None:
+                fin.setdefault('uses_continue', set()).add(cont)
+                current.stmts.append(
+                    ast.Assign(
+                        targets=[
+                            ast.Attribute(
+                                value=_self_name(ast.Load()),
+                                attr=fin['outcome_attr'], ctx=ast.Store(),
+                            )
+                        ],
+                        value=ast.Constant(value=f'continue:{cont}'),
+                    )
+                )
+                current.terminator = TGoto(target=fin['finally_entry'])
+                return current
             current.terminator = TGoto(target=cont)
             return current
         if isinstance(stmt, ast.Try):
@@ -841,11 +978,19 @@ class _CFGBuilder:
         current.terminator = TGoto(target=drive.id)
         drive.terminator = TYieldFrom(iter_var=sub_var, next=nxt.id)
         if capture_name is not None:
-            # Phase 1 simplification: bind to None.
+            # Bind the yield-from return value (StopIteration.value
+            # captured by the TYieldFrom emission) to the user's
+            # capture name. Marked _gen_no_self so the rhs reads our
+            # generated slot rather than self.<sub_var>_value.<value>.
+            rhs = ast.Attribute(
+                value=_self_name(ast.Load()),
+                attr=sub_var + '_value',
+                ctx=ast.Load(),
+            )
             nxt.stmts.append(
                 ast.Assign(
                     targets=[ast.Name(id=capture_name, ctx=ast.Store())],
-                    value=ast.Constant(value=None),
+                    value=rhs,
                 )
             )
         return nxt
@@ -1136,7 +1281,13 @@ class _CFGBuilder:
 
         body_entry = self.new_block()
         current.terminator = TGoto(target=body_entry.id)
-        self.try_stack.append({'handler': dispatcher.id})
+        try_entry = {
+            'handler': dispatcher.id,
+            'finally_entry': finally_entry.id,
+            'outcome_attr': outcome_attr,
+            'loop_depth_at_push': len(self.loop_stack) - 1,
+        }
+        self.try_stack.append(try_entry)
         body_end = self.emit(stmt.body, body_entry)
         self.try_stack.pop()
 
@@ -1146,8 +1297,7 @@ class _CFGBuilder:
             if not body_end.is_terminated:
                 body_end.stmts.append(set_outcome('normal'))
                 body_end.terminator = TGoto(target=else_entry.id)
-            # else exceptions also dispatch.
-            self.try_stack.append({'handler': dispatcher.id})
+            self.try_stack.append(try_entry)
             else_end = self.emit(stmt.orelse, else_entry)
             self.try_stack.pop()
             if not else_end.is_terminated:
@@ -1174,6 +1324,32 @@ class _CFGBuilder:
                 ast.Continue(),
             ]
             for h in reversed(stmt.handlers):
+                # Build the per-handler exception dispatcher BEFORE
+                # the handler entry so h_entry inherits exc_handler
+                # = h_exc_disp.id.
+                h_exc_disp = self.new_block()
+                h_exc_disp.stmts = [
+                    set_outcome('exc'),
+                    ast.Assign(
+                        targets=[
+                            ast.Attribute(
+                                value=_self_name(ast.Load()),
+                                attr='state', ctx=ast.Store(),
+                            )
+                        ],
+                        value=ast.Constant(value=finally_entry.id),
+                    ),
+                    ast.Continue(),
+                ]
+                h_exc_disp.terminator = TUnreachable()
+                # Push the try region so any block created from now on
+                # is stamped with exc_handler = h_exc_disp.id.
+                self.try_stack.append({
+                    'handler': h_exc_disp.id,
+                    'finally_entry': finally_entry.id,
+                    'outcome_attr': outcome_attr,
+                    'loop_depth_at_push': len(self.loop_stack) - 1,
+                })
                 h_entry = self.new_block()
                 if h.name is not None:
                     h_entry.stmts.append(
@@ -1190,27 +1366,6 @@ class _CFGBuilder:
                             ),
                         )
                     )
-                # Handler body's own exceptions also propagate via the
-                # finally — push a try region with finally_entry as
-                # the handler so they set outcome=exc and go there.
-                # We model that by a small dedicated dispatcher for
-                # the handler.
-                h_exc_disp = self.new_block()
-                h_exc_disp.stmts = [
-                    set_outcome('exc'),
-                    ast.Assign(
-                        targets=[
-                            ast.Attribute(
-                                value=_self_name(ast.Load()),
-                                attr='state', ctx=ast.Store(),
-                            )
-                        ],
-                        value=ast.Constant(value=finally_entry.id),
-                    ),
-                    ast.Continue(),
-                ]
-                h_exc_disp.terminator = TUnreachable()
-                self.try_stack.append({'handler': h_exc_disp.id})
                 h_end = self.emit(h.body, h_entry)
                 self.try_stack.pop()
                 if not h_end.is_terminated:
@@ -1255,9 +1410,113 @@ class _CFGBuilder:
         # finally body itself raises, that propagates to the enclosing
         # try (or out of send if none).
         finally_end = self.emit(stmt.finalbody, finally_entry)
-        # outcome router after finally: read outcome and act.
+        # outcome router after finally: read outcome and act. We
+        # build a chain of `if outcome == X: ...` branches in reverse.
         if not finally_end.is_terminated:
-            router_stmts = [
+            router_chain = [
+                # Default tail — outcome=='normal': fall through to join.
+                ast.Assign(
+                    targets=[
+                        ast.Attribute(
+                            value=_self_name(ast.Load()),
+                            attr='state', ctx=ast.Store(),
+                        )
+                    ],
+                    value=ast.Constant(value=join.id),
+                ),
+                ast.Continue(),
+            ]
+            # break:N — set state=N, continue.
+            for brk_target in try_entry.get('uses_break', set()):
+                router_chain = [
+                    ast.If(
+                        test=ast.Compare(
+                            left=ast.Attribute(
+                                value=_self_name(ast.Load()),
+                                attr=outcome_attr, ctx=ast.Load(),
+                            ),
+                            ops=[ast.Eq()],
+                            comparators=[ast.Constant(
+                                value=f'break:{brk_target}'
+                            )],
+                        ),
+                        body=[
+                            ast.Assign(
+                                targets=[
+                                    ast.Attribute(
+                                        value=_self_name(ast.Load()),
+                                        attr='state', ctx=ast.Store(),
+                                    )
+                                ],
+                                value=ast.Constant(value=brk_target),
+                            ),
+                            ast.Continue(),
+                        ],
+                        orelse=router_chain,
+                    )
+                ]
+            # continue:N — set state=N, continue.
+            for cont_target in try_entry.get('uses_continue', set()):
+                router_chain = [
+                    ast.If(
+                        test=ast.Compare(
+                            left=ast.Attribute(
+                                value=_self_name(ast.Load()),
+                                attr=outcome_attr, ctx=ast.Load(),
+                            ),
+                            ops=[ast.Eq()],
+                            comparators=[ast.Constant(
+                                value=f'continue:{cont_target}'
+                            )],
+                        ),
+                        body=[
+                            ast.Assign(
+                                targets=[
+                                    ast.Attribute(
+                                        value=_self_name(ast.Load()),
+                                        attr='state', ctx=ast.Store(),
+                                    )
+                                ],
+                                value=ast.Constant(value=cont_target),
+                            ),
+                            ast.Continue(),
+                        ],
+                        orelse=router_chain,
+                    )
+                ]
+            # return — raise StopIteration(self.<outcome>_retval).
+            if try_entry.get('uses_return'):
+                router_chain = [
+                    ast.If(
+                        test=ast.Compare(
+                            left=ast.Attribute(
+                                value=_self_name(ast.Load()),
+                                attr=outcome_attr, ctx=ast.Load(),
+                            ),
+                            ops=[ast.Eq()],
+                            comparators=[ast.Constant(value='return')],
+                        ),
+                        body=[
+                            ast.Raise(
+                                exc=ast.Call(
+                                    func=ast.Name(id='StopIteration', ctx=ast.Load()),
+                                    args=[
+                                        ast.Attribute(
+                                            value=_self_name(ast.Load()),
+                                            attr=outcome_attr + '_retval',
+                                            ctx=ast.Load(),
+                                        )
+                                    ],
+                                    keywords=[],
+                                ),
+                                cause=None,
+                            ),
+                        ],
+                        orelse=router_chain,
+                    )
+                ]
+            # exc — reraise.
+            router_chain = [
                 ast.If(
                     test=ast.Compare(
                         left=ast.Attribute(
@@ -1276,20 +1535,10 @@ class _CFGBuilder:
                             cause=None,
                         ),
                     ],
-                    orelse=[],
-                ),
-                ast.Assign(
-                    targets=[
-                        ast.Attribute(
-                            value=_self_name(ast.Load()),
-                            attr='state', ctx=ast.Store(),
-                        )
-                    ],
-                    value=ast.Constant(value=join.id),
-                ),
-                ast.Continue(),
+                    orelse=router_chain,
+                )
             ]
-            finally_end.stmts.extend(router_stmts)
+            finally_end.stmts.extend(router_chain)
             finally_end.terminator = TUnreachable()
 
         return join
@@ -1569,12 +1818,13 @@ def emit_state_machine(
     # either continue (loop again) or return (yield) or raise.
     send_def = _emit_send(blocks)
     throw_def = _emit_throw(blocks)
+    close_def = _emit_close()
 
     cls = ast.ClassDef(
         name='_Gen_' + name,
         bases=[],
         keywords=[],
-        body=[init_def, iter_def, next_def, send_def, throw_def],
+        body=[init_def, iter_def, next_def, send_def, throw_def, close_def],
         decorator_list=[],
         type_params=[],
     )
@@ -1648,6 +1898,66 @@ def _args_as_call_kwargs(args: ast.arguments) -> list:
             value=ast.Name(id=args.kwarg.arg, ctx=ast.Load()),
         ))
     return out
+
+
+def _emit_close() -> ast.FunctionDef:
+    """`close()` is throw(GeneratorExit). Per PEP 342:
+       - If body re-raises GeneratorExit / StopIteration: silently OK.
+       - If body yields a value: raise RuntimeError.
+       - If body raises something else: that propagates out.
+    """
+    body = [
+        ast.Try(
+            body=[
+                ast.Assign(
+                    targets=[ast.Name(id='_v', ctx=ast.Store())],
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=_self_name(ast.Load()),
+                            attr='throw', ctx=ast.Load(),
+                        ),
+                        args=[ast.Name(id='GeneratorExit', ctx=ast.Load())],
+                        keywords=[],
+                    ),
+                ),
+                ast.Raise(
+                    exc=ast.Call(
+                        func=ast.Name(id='RuntimeError', ctx=ast.Load()),
+                        args=[ast.Constant(value='generator ignored GeneratorExit')],
+                        keywords=[],
+                    ),
+                    cause=None,
+                ),
+            ],
+            handlers=[
+                ast.ExceptHandler(
+                    type=ast.Tuple(
+                        elts=[
+                            ast.Name(id='GeneratorExit', ctx=ast.Load()),
+                            ast.Name(id='StopIteration', ctx=ast.Load()),
+                        ],
+                        ctx=ast.Load(),
+                    ),
+                    name=None,
+                    body=[ast.Pass()],
+                ),
+            ],
+            orelse=[],
+            finalbody=[],
+        ),
+    ]
+    return ast.FunctionDef(
+        name='close',
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg='self', annotation=None)],
+            vararg=None, kwonlyargs=[], kw_defaults=[], defaults=[],
+        ),
+        body=body,
+        decorator_list=[],
+        returns=None,
+        type_params=[],
+    )
 
 
 def _emit_throw(blocks: list) -> ast.FunctionDef:
@@ -1875,7 +2185,13 @@ def _emit_send(blocks: list) -> ast.FunctionDef:
             body=while_inner,
             handlers=[
                 ast.ExceptHandler(
-                    type=ast.Name(id='Exception', ctx=ast.Load()),
+                    # BaseException, not Exception, so we also catch
+                    # GeneratorExit (raised by close()) and any other
+                    # BaseException-only subclass. The handler-lookup
+                    # logic still re-raises out of send if no user
+                    # try matches, so those keep their original
+                    # propagation semantics.
+                    type=ast.Name(id='BaseException', ctx=ast.Load()),
                     name='_e',
                     body=except_body,
                 ),
@@ -1960,40 +2276,58 @@ def _emit_terminator(t, blocks) -> list:
         ]
     if isinstance(t, TYieldFrom):
         # Drive self.<iter_var> with next(); return its yield value.
-        # When it's exhausted, advance to next state and continue the
-        # loop. Phase 1 doesn't propagate StopIteration.value.
+        # Wrap in try/except StopIteration so we capture the sub-
+        # generator's return value (e.value) into self.<iter_var>_value
+        # for the post-yield-from binding to read.
         return [
-            ast.Assign(
-                targets=[ast.Name(id='_v', ctx=ast.Store())],
-                value=ast.Call(
-                    func=ast.Name(id='next', ctx=ast.Load()),
-                    args=[
-                        ast.Attribute(
-                            value=_self_name(ast.Load()),
-                            attr=t.iter_var, ctx=ast.Load(),
-                        ),
-                        ast.Name(id=_GEN_DONE, ctx=ast.Load()),
-                    ],
-                    keywords=[],
-                ),
-            ),
-            ast.If(
-                test=ast.Compare(
-                    left=ast.Name(id='_v', ctx=ast.Load()),
-                    ops=[ast.Is()],
-                    comparators=[ast.Name(id=_GEN_DONE, ctx=ast.Load())],
-                ),
+            ast.Try(
                 body=[
                     ast.Assign(
-                        targets=[ast.Attribute(
-                            value=_self_name(ast.Load()),
-                            attr='state', ctx=ast.Store(),
-                        )],
-                        value=ast.Constant(value=t.next),
+                        targets=[ast.Name(id='_v', ctx=ast.Store())],
+                        value=ast.Call(
+                            func=ast.Name(id='next', ctx=ast.Load()),
+                            args=[
+                                ast.Attribute(
+                                    value=_self_name(ast.Load()),
+                                    attr=t.iter_var, ctx=ast.Load(),
+                                )
+                            ],
+                            keywords=[],
+                        ),
                     ),
-                    ast.Continue(),
+                    ast.Return(value=ast.Name(id='_v', ctx=ast.Load())),
                 ],
-                orelse=[ast.Return(value=ast.Name(id='_v', ctx=ast.Load()))],
+                handlers=[
+                    ast.ExceptHandler(
+                        type=ast.Name(id='StopIteration', ctx=ast.Load()),
+                        name='_si',
+                        body=[
+                            ast.Assign(
+                                targets=[
+                                    ast.Attribute(
+                                        value=_self_name(ast.Load()),
+                                        attr=t.iter_var + '_value',
+                                        ctx=ast.Store(),
+                                    )
+                                ],
+                                value=ast.Attribute(
+                                    value=ast.Name(id='_si', ctx=ast.Load()),
+                                    attr='value', ctx=ast.Load(),
+                                ),
+                            ),
+                            ast.Assign(
+                                targets=[ast.Attribute(
+                                    value=_self_name(ast.Load()),
+                                    attr='state', ctx=ast.Store(),
+                                )],
+                                value=ast.Constant(value=t.next),
+                            ),
+                            ast.Continue(),
+                        ],
+                    )
+                ],
+                orelse=[],
+                finalbody=[],
             ),
         ]
     if isinstance(t, TForIter):

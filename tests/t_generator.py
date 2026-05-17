@@ -566,3 +566,147 @@ def gen_throw_into_try():
 
 
 print(gen_throw_into_try())
+
+
+def gen_break_runs_finally():
+    log = []
+
+    def gen():
+        for i in range(3):
+            try:
+                yield i
+                if i == 1:
+                    break
+            finally:
+                log.append(('fin', i))
+
+    out = list(gen())
+    return (out, log)
+
+
+print(gen_break_runs_finally())
+
+
+def gen_continue_runs_finally():
+    log = []
+
+    def gen():
+        for i in range(3):
+            try:
+                yield i
+                if i == 1:
+                    continue
+            finally:
+                log.append(('fin', i))
+
+    out = list(gen())
+    return (out, log)
+
+
+print(gen_continue_runs_finally())
+
+
+def gen_return_runs_finally():
+    log = []
+
+    def gen():
+        try:
+            yield 1
+            return 'done'
+        finally:
+            log.append('fin')
+
+    g = gen()
+    out = [next(g)]
+    try:
+        next(g)
+    except StopIteration as e:
+        out.append(('val', e.value))
+    return (out, log)
+
+
+print(gen_return_runs_finally())
+
+
+def gen_bare_raise_in_handler():
+    def gen():
+        try:
+            yield 1
+            raise ValueError('inner')
+        except ValueError:
+            raise
+
+    g = gen()
+    out = [next(g)]
+    try:
+        next(g)
+        out.append('unreached')
+    except ValueError as e:
+        out.append(('caught', str(e)))
+    return out
+
+
+print(gen_bare_raise_in_handler())
+
+
+def gen_yield_from_value():
+    def inner():
+        yield 1
+        yield 2
+        return 'inner-done'
+
+    def outer():
+        val = (yield from inner())
+        yield ('result', val)
+
+    return list(outer())
+
+
+print(gen_yield_from_value())
+
+
+def gen_close_simple():
+    log = []
+
+    def gen():
+        try:
+            yield 1
+            yield 2
+        except GeneratorExit:
+            log.append('caught-exit')
+            raise
+        finally:
+            log.append('fin')
+
+    g = gen()
+    next(g)
+    g.close()
+    return log
+
+
+print(gen_close_simple())
+
+
+def gen_throw_into_finally():
+    log = []
+
+    def gen():
+        try:
+            yield 1
+        except ValueError:
+            log.append('caught')
+            yield 'after'
+        finally:
+            log.append('fin')
+
+    g = gen()
+    out = [next(g)]
+    out.append(g.throw(ValueError))
+    try:
+        next(g)
+    except StopIteration:
+        out.append('stopped')
+    return (out, log)
+
+
+print(gen_throw_into_finally())
