@@ -107,11 +107,23 @@ _onexpr_patch_loop_cls(_OnexprLoop)
 
 
 class _TryHelper:
-    loop = _OnexprLoop()
+    # _loop is created lazily on first use of `guarded()`. Instantiating
+    # an event loop at import time interferes with code that calls
+    # asyncio.run() in the same process — asyncio's per-thread bookkeeping
+    # gets confused if a SelectorEventLoop already exists when the user's
+    # asyncio.run creates a fresh one. Lazy creation keeps _TryHelper
+    # inert until something actually uses it.
+    _loop = None
+
+    @staticmethod
+    def _get_loop():
+        if _TryHelper._loop is None:
+            _TryHelper._loop = _OnexprLoop()
+        return _TryHelper._loop
 
     @staticmethod
     def guarded(fn):
-        loop = _TryHelper.loop
+        loop = _TryHelper._get_loop()
         captured = [None]
         prev_handler = loop.get_exception_handler()
 

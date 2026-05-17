@@ -155,3 +155,49 @@ def _make_class(metaclass, name, bases, body_dict):
     ns.update(body_dict)
     return metaclass(name, bases, ns)
 
+
+# Coroutine plumbing: an `await x` expression in user code lowers to
+# `yield from _await_iter(x)`. _await_iter takes either a real
+# coroutine (objects implementing __await__) or one of our fake
+# generator-as-coroutines (created by `async def` lowering — they're
+# plain generators registered as collections.abc.Coroutine via
+# helpers.py's add_helper) and returns the iterator that `yield from`
+# can drive.
+def _await_iter(x):
+    if hasattr(x, '__await__'):
+        return x.__await__()
+    return iter(x)
+
+
+# Async generator wrapper: an `async def f(): yield V` body becomes
+# a plain generator state machine; we wrap its instance in this
+# class so it satisfies the async iterator protocol (__aiter__ /
+# __anext__). __anext__ is itself a coroutine that pulls one value
+# off the underlying sync generator and returns it as the awaited
+# result. This minimal model only supports async generators whose
+# body contains no `await` — a body that mixes yield and await needs
+# the full async-generator protocol where intermediate awaits
+# propagate through anext, which we don't model yet.
+class _AsyncGenWrapper:
+    def __init__(self, gen):
+        self._g = gen
+
+    def __aiter__(self):
+        return self
+
+    def __anext__(self):
+        return _async_gen_anext(self._g)
+
+
+def _async_gen_anext(g):
+    try:
+        v = next(g)
+    except StopIteration:
+        raise StopAsyncIteration
+    return v
+    yield  # noqa — never reached; presence makes this a generator function
+
+
+# Mark _async_gen_anext as a coroutine so `await __anext__()` accepts it.
+_async_gen_anext = __import__('types').coroutine(_async_gen_anext)
+

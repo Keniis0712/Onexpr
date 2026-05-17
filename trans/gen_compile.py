@@ -1680,6 +1680,8 @@ def emit_state_machine(
     blocks: list,
     boxed: set,
     decorator_list: list,
+    is_async: bool = False,
+    async_kind: str = None,
 ) -> list:
     """Build a sequence of statements that defines the generator class
     and binds it to `name`. Returned statements are intended to be
@@ -1833,13 +1835,51 @@ def emit_state_machine(
     #   _Gen_name = <class>
     #   name = lambda *a, **kw: _Gen_name(*a, **kw)  (with decorators)
     # Decorators are applied to the lambda, not the class.
+    #
+    # When the original user function was `async def`, the forwarder
+    # is a generator-yielding-from-the-state-machine wrapped in
+    # types.coroutine, which makes it awaitable. types.coroutine
+    # requires a generator function — a lambda containing `yield from`
+    # qualifies.
     forwarder_args = _clone_args_for_forwarder(args)
     forwarder_call = ast.Call(
         func=ast.Name(id=cls.name, ctx=ast.Load()),
         args=_args_as_call_args(args),
         keywords=_args_as_call_kwargs(args),
     )
-    forwarder = ast.Lambda(args=forwarder_args, body=forwarder_call)
+    if async_kind is None and is_async:
+        async_kind = 'coro'
+    if async_kind == 'coro':
+        gen_lambda = ast.Lambda(
+            args=forwarder_args,
+            body=ast.YieldFrom(value=forwarder_call),
+        )
+        # types.coroutine(gen_lambda)
+        forwarder = ast.Call(
+            func=ast.Attribute(
+                value=ast.Call(
+                    func=ast.Name(id='__import__', ctx=ast.Load()),
+                    args=[ast.Constant(value='types')],
+                    keywords=[],
+                ),
+                attr='coroutine', ctx=ast.Load(),
+            ),
+            args=[gen_lambda],
+            keywords=[],
+        )
+    elif async_kind == 'gen':
+        # Wrap _Gen_name(*a, **kw) in _AsyncGenWrapper so the user's
+        # call to name(*a, **kw) returns an async iterable.
+        forwarder = ast.Lambda(
+            args=forwarder_args,
+            body=ast.Call(
+                func=ast.Name(id='_AsyncGenWrapper', ctx=ast.Load()),
+                args=[forwarder_call],
+                keywords=[],
+            ),
+        )
+    else:
+        forwarder = ast.Lambda(args=forwarder_args, body=forwarder_call)
 
     # Apply decorators outside-in (same order as Python's `@deco`).
     decorated = forwarder
@@ -2180,26 +2220,33 @@ def _emit_send(blocks: list) -> ast.FunctionDef:
         ),
     ]
 
-    while_body = [
-        ast.Try(
-            body=while_inner,
-            handlers=[
-                ast.ExceptHandler(
-                    # BaseException, not Exception, so we also catch
-                    # GeneratorExit (raised by close()) and any other
-                    # BaseException-only subclass. The handler-lookup
-                    # logic still re-raises out of send if no user
-                    # try matches, so those keep their original
-                    # propagation semantics.
-                    type=ast.Name(id='BaseException', ctx=ast.Load()),
-                    name='_e',
-                    body=except_body,
-                ),
-            ],
-            orelse=[],
-            finalbody=[],
-        )
-    ]
+    if eh_keys:
+        while_body = [
+            ast.Try(
+                body=while_inner,
+                handlers=[
+                    ast.ExceptHandler(
+                        # BaseException, not Exception, so we also catch
+                        # GeneratorExit (raised by close()) and any other
+                        # BaseException-only subclass. The handler-lookup
+                        # logic still re-raises out of send if no user
+                        # try matches, so those keep their original
+                        # propagation semantics.
+                        type=ast.Name(id='BaseException', ctx=ast.Load()),
+                        name='_e',
+                        body=except_body,
+                    ),
+                ],
+                orelse=[],
+                finalbody=[],
+            )
+        ]
+    else:
+        # No user try in body — exceptions just propagate out of send.
+        # Skipping the outer try keeps onexpr from compiling it through
+        # _TryHelper.dispatch, which would otherwise instantiate an
+        # event loop and interfere with user asyncio code.
+        while_body = while_inner
 
     body = [
         # self._sent = sent
@@ -2434,14 +2481,27 @@ def _emit_terminator(t, blocks) -> list:
 # ---------------------------------------------------------------------
 # Top-level entrypoint, called from parse_function_def
 
-def compile_generator(stmt, frame) -> list:
+def compile_generator(stmt, frame, is_async=False, async_kind=None) -> list:
     """Replace `def gen(args): BODY` (with yields in BODY) with the
     state-machine class + a forwarder lambda binding the user's name.
 
     Returned statements are spliced into the enclosing scope and
     processed by parse_stmts. parse_class_def will compile the class
     via the regular onexpr path; the methods inside are plain
-    synchronous Python and don't trip on yields."""
+    synchronous Python and don't trip on yields.
+
+    `async_kind` toggles forwarder shape:
+    - None (default) / 'sync': plain generator forwarder (no wrapping)
+    - 'coro': `async def` without yield. Forwarder is wrapped in
+      types.coroutine so the result is awaitable.
+    - 'gen': `async def` with yield (PEP 525 async generator).
+      Forwarder returns _AsyncGenWrapper(_Gen_name(...)) so `async
+      for` works.
+
+    `is_async` is the legacy boolean for backward compatibility; when
+    set without async_kind, it means 'coro'."""
+    if async_kind is None and is_async:
+        async_kind = 'coro'
 
     name_provider = frame.get_temp_var
 
@@ -2471,4 +2531,5 @@ def compile_generator(stmt, frame) -> list:
         blocks=blocks,
         boxed=boxed,
         decorator_list=stmt.decorator_list,
+        async_kind=async_kind,
     )

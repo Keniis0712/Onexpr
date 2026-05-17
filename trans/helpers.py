@@ -40,9 +40,31 @@ def _has_pep695(tree: ast.AST) -> bool:
     return False
 
 
+def _has_async_generator(tree: ast.AST) -> bool:
+    """True iff the tree contains an AsyncFunctionDef whose body uses
+    yield / yield from directly. Such functions are async generators
+    (PEP 525) and need a different shape than plain async def."""
+    class _V(ast.NodeVisitor):
+        def __init__(self):
+            self.found = False
+        def visit_Lambda(self, node): pass
+        def visit_Yield(self, node): self.found = True
+        def visit_YieldFrom(self, node): self.found = True
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef):
+            v = _V()
+            for s in node.body:
+                v.visit(s)
+                if v.found:
+                    return True
+    return False
+
+
 def _has_generator_function(tree: ast.AST) -> bool:
     """True iff the tree contains a FunctionDef whose body uses
-    yield / yield from directly (not in a nested function)."""
+    yield / yield from directly (not in a nested function), or any
+    AsyncFunctionDef (which we lower to a generator state machine)."""
     class _V(ast.NodeVisitor):
         def __init__(self):
             self.found = False
@@ -54,6 +76,8 @@ def _has_generator_function(tree: ast.AST) -> bool:
             self.found = True
 
     for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef):
+            return True
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             v = _V()
             for s in node.body:
@@ -86,14 +110,21 @@ def _get_core_helper_body() -> list:
     kept = []
     for stmt in body:
         if isinstance(stmt, ast.ClassDef) and stmt.name in (
-            func_helper_name, for_helper_name, while_helper_name
+            func_helper_name, for_helper_name, while_helper_name,
+            '_AsyncGenWrapper',
         ):
-            _mark_legacy_return(stmt)
+            if stmt.name in (func_helper_name, for_helper_name, while_helper_name):
+                _mark_legacy_return(stmt)
             kept.append(stmt)
         elif isinstance(stmt, ast.FunctionDef):
             # Module-level helper functions (e.g. _del_local). These
             # appear after the helper classes, so they CAN reference
             # _FuncHelper through the regular transform path.
+            kept.append(stmt)
+        elif isinstance(stmt, ast.Assign):
+            # Module-level Assigns in core.py (e.g. the
+            # types.coroutine wrap on _async_gen_anext). Keep them so
+            # they get spliced in alongside their owning function.
             kept.append(stmt)
     return kept
 
@@ -141,7 +172,13 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
     # (e.g. _del_local) are pulled in on demand based on what the user
     # code uses.
     core_body = _get_core_helper_body()
-    core_by_name = {s.name: s for s in core_body}
+    core_by_name = {}
+    core_extras = []
+    for s in core_body:
+        if hasattr(s, 'name'):
+            core_by_name[s.name] = s
+        else:
+            core_extras.append(s)
 
     to_insert = [core_by_name[func_helper_name]]
     if needs_for:
@@ -187,16 +224,14 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
                 )
             ]
         ))
+        if '_await_iter' in core_by_name:
+            to_insert.append(core_by_name['_await_iter'])
         to_insert.append(
             ast.Expr(
                 value=ast.Call(
                     func=ast.Attribute(
                         value=ast.Attribute(
-                            value=ast.Attribute(
-                                value=ast.Name(id=LIB_COLLECTIONS, ctx=ast.Load()),
-                                attr='abc',
-                                ctx=ast.Load()
-                            ),
+                            value=ast.Name(id=LIB_COLLECTIONS, ctx=ast.Load()),
                             attr='Coroutine',
                             ctx=ast.Load()
                         ),
@@ -214,6 +249,20 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
                 )
             )
         )
+
+        # If the user has an `async def` with `yield` (an async
+        # generator), pull in _AsyncGenWrapper + _async_gen_anext +
+        # the types.coroutine wrap assign.
+        if _has_async_generator(tree):
+            for n in ('_AsyncGenWrapper', '_async_gen_anext'):
+                if n in core_by_name:
+                    to_insert.append(core_by_name[n])
+            # The Assign that wraps _async_gen_anext via types.coroutine
+            # lives in core_extras (it's an Assign, not a def).
+            for s in core_extras:
+                # All extras are tied to async-gen plumbing right now,
+                # so include them here.
+                to_insert.append(s)
 
     to_insert.append(
         ast.Assign(

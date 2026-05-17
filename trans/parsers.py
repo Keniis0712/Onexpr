@@ -350,7 +350,322 @@ def _generator_body_has_yield(fdef) -> bool:
 
 
 def parse_async_function_def(stmt: ast.AsyncFunctionDef, frame: Frame) -> list[_ast.AST]:
-    return None
+    # Lower `async def f(args): BODY` to a regular generator function.
+    # Each `await x` inside BODY (not crossing nested def/class/lambda)
+    # becomes `yield from _await_iter(x)`. async for / async with also
+    # get lowered to their await-based equivalents.
+    #
+    # If the user's body had a direct yield, this is an async
+    # generator (PEP 525): we wrap the state-machine instance in an
+    # _AsyncGenWrapper so it satisfies the async-iter protocol.
+    # Otherwise the function is a coroutine: we wrap the forwarder
+    # in types.coroutine. (See gen_compile.emit_state_machine for
+    # the coroutine forwarder shape.)
+    is_async_gen = _body_has_yield_or_yield_from(stmt.body)
+    stmt.body = _lower_async_constructs(stmt.body)
+    _rewrite_await_in_body(stmt.body)
+    if not _body_has_yield_or_yield_from(stmt.body):
+        stmt.body.insert(
+            0,
+            ast.If(
+                test=ast.Constant(value=False),
+                body=[ast.Expr(value=ast.Yield(value=None))],
+                orelse=[],
+            ),
+        )
+    fdef = ast.FunctionDef(
+        name=stmt.name,
+        args=stmt.args,
+        body=stmt.body,
+        decorator_list=stmt.decorator_list,
+        returns=stmt.returns,
+        type_params=getattr(stmt, 'type_params', []) or [],
+    )
+    for attr in ('_use_legacy_return', '_box_helper_var'):
+        if hasattr(stmt, attr):
+            setattr(fdef, attr, getattr(stmt, attr))
+    from .gen_compile import compile_generator
+    if is_async_gen:
+        return compile_generator(fdef, frame, async_kind='gen')
+    return compile_generator(fdef, frame, async_kind='coro')
+
+
+def _lower_async_constructs(body):
+    """Lower `async for` / `async with` to `await`-based equivalents.
+    Recurses into compound statements but stops at nested function /
+    class / lambda boundaries (they have their own scope; if any of
+    them is an `async def`, parse_async_function_def will lower it
+    when the time comes)."""
+    out = []
+    for stmt in body:
+        if isinstance(stmt, ast.AsyncFor):
+            out.extend(_lower_async_for(stmt))
+            continue
+        if isinstance(stmt, ast.AsyncWith):
+            out.extend(_lower_async_with(stmt))
+            continue
+        if isinstance(stmt, ast.If):
+            stmt.body = _lower_async_constructs(stmt.body)
+            stmt.orelse = _lower_async_constructs(stmt.orelse)
+            out.append(stmt)
+            continue
+        if isinstance(stmt, ast.For):
+            stmt.body = _lower_async_constructs(stmt.body)
+            stmt.orelse = _lower_async_constructs(stmt.orelse)
+            out.append(stmt)
+            continue
+        if isinstance(stmt, ast.While):
+            stmt.body = _lower_async_constructs(stmt.body)
+            stmt.orelse = _lower_async_constructs(stmt.orelse)
+            out.append(stmt)
+            continue
+        if isinstance(stmt, ast.Try):
+            stmt.body = _lower_async_constructs(stmt.body)
+            for h in stmt.handlers:
+                h.body = _lower_async_constructs(h.body)
+            stmt.orelse = _lower_async_constructs(stmt.orelse)
+            stmt.finalbody = _lower_async_constructs(stmt.finalbody)
+            out.append(stmt)
+            continue
+        if isinstance(stmt, ast.With):
+            stmt.body = _lower_async_constructs(stmt.body)
+            out.append(stmt)
+            continue
+        if isinstance(stmt, ast.Match):
+            for case in stmt.cases:
+                case.body = _lower_async_constructs(case.body)
+            out.append(stmt)
+            continue
+        out.append(stmt)
+    return out
+
+
+def _lower_async_for(stmt: ast.AsyncFor) -> list:
+    """`async for x in iter: BODY else: ELSE` becomes:
+
+        _it = type(iter).__aiter__(iter)
+        while True:
+            try:
+                x = await type(_it).__anext__(_it)
+            except StopAsyncIteration:
+                break
+            BODY
+        else:
+            ELSE
+    """
+    it_var = '_aiter_' + str(id(stmt))[-6:]
+    # _it = type(iter).__aiter__(iter)
+    setup = ast.Assign(
+        targets=[ast.Name(id=it_var, ctx=ast.Store())],
+        value=ast.Call(
+            func=ast.Attribute(
+                value=ast.Call(
+                    func=ast.Name(id='type', ctx=ast.Load()),
+                    args=[stmt.iter],
+                    keywords=[],
+                ),
+                attr='__aiter__', ctx=ast.Load(),
+            ),
+            args=[stmt.iter],
+            keywords=[],
+        ),
+    )
+    # x = await type(_it).__anext__(_it)
+    next_call = ast.Await(
+        value=ast.Call(
+            func=ast.Attribute(
+                value=ast.Call(
+                    func=ast.Name(id='type', ctx=ast.Load()),
+                    args=[ast.Name(id=it_var, ctx=ast.Load())],
+                    keywords=[],
+                ),
+                attr='__anext__', ctx=ast.Load(),
+            ),
+            args=[ast.Name(id=it_var, ctx=ast.Load())],
+            keywords=[],
+        ),
+    )
+    try_body = [
+        ast.Assign(
+            targets=[stmt.target],
+            value=next_call,
+        ),
+    ]
+    try_node = ast.Try(
+        body=try_body,
+        handlers=[
+            ast.ExceptHandler(
+                type=ast.Name(id='StopAsyncIteration', ctx=ast.Load()),
+                name=None,
+                body=[ast.Break()],
+            ),
+        ],
+        orelse=[],
+        finalbody=[],
+    )
+    while_body = [try_node] + _lower_async_constructs(stmt.body)
+    while_node = ast.While(
+        test=ast.Constant(value=True),
+        body=while_body,
+        orelse=_lower_async_constructs(stmt.orelse),
+    )
+    return [setup, while_node]
+
+
+def _lower_async_with(stmt: ast.AsyncWith) -> list:
+    """`async with X as v: BODY` lowers to PEP 492 equivalent using
+    await for __aenter__ and __aexit__. Multiple items recurse."""
+    if len(stmt.items) > 1:
+        first, *rest = stmt.items
+        inner = ast.AsyncWith(items=rest, body=stmt.body)
+        return _lower_async_with(
+            ast.AsyncWith(items=[first], body=[inner]),
+        )
+    item = stmt.items[0]
+    mgr = '_amgr_' + str(id(stmt))[-6:]
+    exc_flag = '_aexc_' + str(id(stmt))[-6:]
+    e_name = '_ae_' + str(id(stmt))[-6:]
+
+    setup = [
+        ast.Assign(
+            targets=[ast.Name(id=mgr, ctx=ast.Store())],
+            value=item.context_expr,
+        ),
+    ]
+    enter_call = ast.Await(
+        value=ast.Call(
+            func=ast.Attribute(
+                value=ast.Call(
+                    func=ast.Name(id='type', ctx=ast.Load()),
+                    args=[ast.Name(id=mgr, ctx=ast.Load())],
+                    keywords=[],
+                ),
+                attr='__aenter__', ctx=ast.Load(),
+            ),
+            args=[ast.Name(id=mgr, ctx=ast.Load())],
+            keywords=[],
+        ),
+    )
+    if item.optional_vars is not None:
+        setup.append(ast.Assign(
+            targets=[item.optional_vars],
+            value=enter_call,
+        ))
+    else:
+        setup.append(ast.Expr(value=enter_call))
+    setup.append(ast.Assign(
+        targets=[ast.Name(id=exc_flag, ctx=ast.Store())],
+        value=ast.Constant(value=True),
+    ))
+    aexit = lambda *args: ast.Await(
+        value=ast.Call(
+            func=ast.Attribute(
+                value=ast.Call(
+                    func=ast.Name(id='type', ctx=ast.Load()),
+                    args=[ast.Name(id=mgr, ctx=ast.Load())],
+                    keywords=[],
+                ),
+                attr='__aexit__', ctx=ast.Load(),
+            ),
+            args=[ast.Name(id=mgr, ctx=ast.Load())] + list(args),
+            keywords=[],
+        ),
+    )
+    handler_body = [
+        ast.Assign(
+            targets=[ast.Name(id=exc_flag, ctx=ast.Store())],
+            value=ast.Constant(value=False),
+        ),
+        ast.If(
+            test=ast.UnaryOp(
+                op=ast.Not(),
+                operand=aexit(
+                    ast.Call(
+                        func=ast.Name(id='type', ctx=ast.Load()),
+                        args=[ast.Name(id=e_name, ctx=ast.Load())],
+                        keywords=[],
+                    ),
+                    ast.Name(id=e_name, ctx=ast.Load()),
+                    ast.Attribute(
+                        value=ast.Name(id=e_name, ctx=ast.Load()),
+                        attr='__traceback__', ctx=ast.Load(),
+                    ),
+                ),
+            ),
+            body=[ast.Raise(
+                exc=ast.Name(id=e_name, ctx=ast.Load()),
+                cause=None,
+            )],
+            orelse=[],
+        ),
+    ]
+    final_body = [
+        ast.If(
+            test=ast.Name(id=exc_flag, ctx=ast.Load()),
+            body=[
+                ast.Expr(value=aexit(
+                    ast.Constant(value=None),
+                    ast.Constant(value=None),
+                    ast.Constant(value=None),
+                )),
+            ],
+            orelse=[],
+        ),
+    ]
+    try_node = ast.Try(
+        body=_lower_async_constructs(stmt.body),
+        handlers=[
+            ast.ExceptHandler(
+                type=ast.Name(id='BaseException', ctx=ast.Load()),
+                name=e_name,
+                body=handler_body,
+            )
+        ],
+        orelse=[],
+        finalbody=final_body,
+    )
+    return setup + [try_node]
+
+
+def _rewrite_await_in_body(body):
+    """Walk the function body, replacing `await x` with
+    `yield from _await_iter(x)` (the latter wrapped in YieldFrom so
+    the existing generator pipeline sees a yield)."""
+    class _R(ast.NodeTransformer):
+        def visit_Await(self, node):
+            self.generic_visit(node)
+            return ast.YieldFrom(
+                value=ast.Call(
+                    func=ast.Name(id='_await_iter', ctx=ast.Load()),
+                    args=[node.value],
+                    keywords=[],
+                )
+            )
+
+        def visit_FunctionDef(self, node): return node
+        def visit_AsyncFunctionDef(self, node): return node
+        def visit_ClassDef(self, node): return node
+        def visit_Lambda(self, node): return node
+
+    r = _R()
+    for i, s in enumerate(body):
+        body[i] = r.visit(s)
+
+
+def _body_has_yield_or_yield_from(body):
+    class _V(ast.NodeVisitor):
+        def __init__(self): self.found = False
+        def visit_Yield(self, node): self.found = True
+        def visit_YieldFrom(self, node): self.found = True
+        def visit_FunctionDef(self, node): pass
+        def visit_AsyncFunctionDef(self, node): pass
+        def visit_ClassDef(self, node): pass
+        def visit_Lambda(self, node): pass
+
+    v = _V()
+    for s in body:
+        v.visit(s)
+    return v.found
 
 
 def _collect_class_body_names(body: list) -> list:
@@ -1883,19 +2198,38 @@ def parse_import(stmt: ast.Import, frame: Frame) -> list[_ast.AST]:
     for import_name in stmt.names:
         name, as_name = import_name.name, import_name.asname
         if as_name is None:
-            as_name = name.split('.')[0]
-        stmts.append(
-            ast.Assign(
-                targets=[ast.Name(id=as_name, ctx=ast.Store())],
-                value=ast.Call(
-                    func=ast.Name(id='__import__', ctx=ast.Load()),
-                    args=[
-                        ast.Constant(value=name),
-                    ],
-                    keywords=[],
-                ),
+            # `import a.b.c` binds the top-level package `a` to the
+            # current scope. __import__('a.b.c') already returns `a`.
+            top = name.split('.')[0]
+            stmts.append(
+                ast.Assign(
+                    targets=[ast.Name(id=top, ctx=ast.Store())],
+                    value=ast.Call(
+                        func=ast.Name(id='__import__', ctx=ast.Load()),
+                        args=[ast.Constant(value=name)],
+                        keywords=[],
+                    ),
+                )
             )
-        )
+        else:
+            # `import a.b.c as alias` binds the deepest submodule. We
+            # must walk the attribute chain because __import__('a.b.c')
+            # returns `a`, not `a.b.c`.
+            value = ast.Call(
+                func=ast.Name(id='__import__', ctx=ast.Load()),
+                args=[ast.Constant(value=name)],
+                keywords=[],
+            )
+            for part in name.split('.')[1:]:
+                value = ast.Attribute(
+                    value=value, attr=part, ctx=ast.Load(),
+                )
+            stmts.append(
+                ast.Assign(
+                    targets=[ast.Name(id=as_name, ctx=ast.Store())],
+                    value=value,
+                )
+            )
     return stmts
 
 
