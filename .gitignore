@@ -5,3 +5,4 @@ tests/temp/
 .claude/
 CLAUDE.md
 .venv/
+.idea/
