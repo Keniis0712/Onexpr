@@ -279,3 +279,40 @@ async def ag_protocol():
 
 
 print(asyncio.run(ag_protocol()))
+
+
+# Regression: asyncio.wait_for / asyncio.timeout used to fail with
+# "Timeout should be used inside a task". The _OnexprLoop's _run_once
+# now restores the prior running loop while a callback runs so user
+# code that queries asyncio.get_running_loop() inside a try-region
+# callback sees the loop their Task actually belongs to.
+async def aio_wait_for():
+    async def slow():
+        await asyncio.sleep(0.01)
+        return 'wf-done'
+    return await asyncio.wait_for(slow(), timeout=1.0)
+
+
+print(asyncio.run(aio_wait_for()))
+
+
+async def aio_timeout_async_with():
+    async with asyncio.timeout(1.0):
+        await asyncio.sleep(0)
+        return 'ato-done'
+
+
+print(asyncio.run(aio_timeout_async_with()))
+
+
+async def aio_wait_for_timeout():
+    async def really_slow():
+        await asyncio.sleep(10)
+        return 'never'
+    try:
+        return await asyncio.wait_for(really_slow(), timeout=0.05)
+    except asyncio.TimeoutError:
+        return 'caught-timeout'
+
+
+print(asyncio.run(aio_wait_for_timeout()))

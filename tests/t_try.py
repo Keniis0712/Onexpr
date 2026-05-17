@@ -421,3 +421,30 @@ def while_with_continue_in_try():
 
 
 print(while_with_continue_in_try())
+
+
+# Regression: three-layer exception chain — the middle exception's
+# __context__ used to drop. Now _TryHelper.dispatch maintains a stack
+# of currently-being-handled exceptions so a try inside an except
+# clause can implicitly chain the inner exception's __context__ to
+# the outer caught one.
+def chain_three():
+    def inner_raise():
+        try:
+            raise ValueError('orig')
+        except ValueError:
+            try:
+                raise TypeError('next')
+            except TypeError as te:
+                raise RuntimeError('final') from te
+
+    try:
+        inner_raise()
+    except RuntimeError as e:
+        return (
+            type(e.__cause__).__name__,
+            type(e.__cause__.__context__).__name__,
+        )
+
+
+print(chain_three())

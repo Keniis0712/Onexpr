@@ -48,6 +48,12 @@ def _onexpr_patch_loop_cls(cls):
         self._thread_id = threading.get_ident()
         _events._set_running_loop(self)
         self._num_runs_pending += 1
+        # Stash the prior running loop so _run_once can briefly
+        # restore it while a user callback runs — this prevents our
+        # nested loop from masking the user's asyncio.run() loop in
+        # `tasks.current_task()` / `asyncio.get_running_loop()`
+        # queries from inside the callback body.
+        self._onexpr_prev_loop = old_running_loop
 
         while True:
             self._run_once()
@@ -78,13 +84,24 @@ def _onexpr_patch_loop_cls(cls):
             handle = heappop(scheduled)
             ready.append(handle)
 
+        prev_loop = getattr(self, '_onexpr_prev_loop', None)
         for _ in range(len(ready)):
             if not ready:
                 break
             handle = ready.popleft()
             if not handle._cancelled:
                 curr_task = curr_tasks.pop(self, None)
+                # While the callback runs, restore the prior running
+                # loop so user code that queries
+                # asyncio.get_running_loop() / current_task() sees
+                # the loop their Task actually belongs to. Switch
+                # back when control returns so the rest of _run_once
+                # behaves as before.
+                if prev_loop is not None:
+                    _events._set_running_loop(prev_loop)
                 handle._run()
+                if prev_loop is not None:
+                    _events._set_running_loop(self)
                 if curr_task is not None:
                     curr_tasks[self] = curr_task
 
@@ -114,6 +131,14 @@ class _TryHelper:
     # asyncio.run creates a fresh one. Lazy creation keeps _TryHelper
     # inert until something actually uses it.
     _loop = None
+
+    # Stack of exceptions that are currently being handled. CPython
+    # uses the thread-state's exc_info chain for this; we emulate with
+    # a simple list pushed by dispatch when entering a handler. When a
+    # handler body raises something, we set its __context__ to the
+    # top-of-stack so deeply-nested chains (try inside an except) also
+    # surface the outer exception.
+    _exc_stack = []
 
     @staticmethod
     def _get_loop():
@@ -157,6 +182,17 @@ class _TryHelper:
           detect whether body did `break`; None if not in a loop
         """
         e1 = _TryHelper.guarded(body_fn)
+        # If the body's exception has no __context__ yet but we're
+        # nested inside an outer handler, link it. This matches what
+        # CPython does when a try body inside an except clause raises
+        # something fresh.
+        if (
+            e1 is not None
+            and e1.__context__ is None
+            and _TryHelper._exc_stack
+            and e1 is not _TryHelper._exc_stack[-1]
+        ):
+            e1.__context__ = _TryHelper._exc_stack[-1]
         if e1 is None:
             terminated = func_helper.returned
             if not terminated and loop_helper is not None:
@@ -169,7 +205,9 @@ class _TryHelper:
         # body raised
         for exc_types, handler in handlers:
             if exc_types is None or isinstance(e1, exc_types):
+                _TryHelper._exc_stack.append(e1)
                 e2 = _TryHelper.guarded(lambda: handler(e1))
+                _TryHelper._exc_stack.pop()
                 # If the handler itself raised, Python sets the new
                 # exception's __context__ to the one it was handling.
                 # CPython does this in RAISE_VARARGS by reading the

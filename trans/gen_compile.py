@@ -2518,6 +2518,36 @@ def _emit_throw(blocks: list) -> ast.FunctionDef:
                                 )),
                             ],
                         ),
+                        ast.ExceptHandler(
+                            # Anything else inner.throw raised: clear
+                            # _yfrom, then re-inject the new exception
+                            # at the current yield-from state via
+                            # self.throw, so the user's surrounding
+                            # try/except can catch it. (CPython's
+                            # `yield from` re-raises whatever
+                            # inner.throw raised at the yield-from site.)
+                            type=ast.Name(id='BaseException', ctx=ast.Load()),
+                            name='_eb',
+                            body=[
+                                ast.Assign(
+                                    targets=[
+                                        ast.Attribute(
+                                            value=_self_name(ast.Load()),
+                                            attr='_yfrom', ctx=ast.Store(),
+                                        )
+                                    ],
+                                    value=ast.Constant(value=None),
+                                ),
+                                ast.Return(value=ast.Call(
+                                    func=ast.Attribute(
+                                        value=_self_name(ast.Load()),
+                                        attr='throw', ctx=ast.Load(),
+                                    ),
+                                    args=[ast.Name(id='_eb', ctx=ast.Load())],
+                                    keywords=[],
+                                )),
+                            ],
+                        ),
                     ],
                     orelse=[],
                     finalbody=[],
