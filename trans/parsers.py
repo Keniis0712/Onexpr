@@ -2510,6 +2510,92 @@ def parse_import_from(stmt: ast.ImportFrom, frame: Frame) -> list[_ast.AST]:
             ),
         )
     )
+    if len(stmt.names) == 1 and stmt.names[0].name == '*':
+        # `from m import *` — pull in everything in m.__all__ if defined,
+        # otherwise every name in dir(m) that doesn't start with '_'.
+        # We push into globals() since star-imports are only valid at
+        # module level anyway.
+        key_var = frame.get_temp_var()
+        name_var = frame.get_temp_var()
+        names_iter = ast.IfExp(
+            test=ast.Call(
+                func=ast.Name(id='hasattr', ctx=ast.Load()),
+                args=[
+                    ast.Name(id=module_var, ctx=ast.Load()),
+                    ast.Constant(value='__all__'),
+                ],
+                keywords=[],
+            ),
+            body=ast.Attribute(
+                value=ast.Name(id=module_var, ctx=ast.Load()),
+                attr='__all__',
+                ctx=ast.Load(),
+            ),
+            orelse=ast.ListComp(
+                elt=ast.Name(id=name_var, ctx=ast.Load()),
+                generators=[
+                    ast.comprehension(
+                        target=ast.Name(id=name_var, ctx=ast.Store()),
+                        iter=ast.Call(
+                            func=ast.Name(id='dir', ctx=ast.Load()),
+                            args=[ast.Name(id=module_var, ctx=ast.Load())],
+                            keywords=[],
+                        ),
+                        ifs=[
+                            ast.UnaryOp(
+                                op=ast.Not(),
+                                operand=ast.Call(
+                                    func=ast.Attribute(
+                                        value=ast.Name(id=name_var, ctx=ast.Load()),
+                                        attr='startswith',
+                                        ctx=ast.Load(),
+                                    ),
+                                    args=[ast.Constant(value='_')],
+                                    keywords=[],
+                                ),
+                            ),
+                        ],
+                        is_async=0,
+                    ),
+                ],
+            ),
+        )
+        update_dict = ast.DictComp(
+            key=ast.Name(id=key_var, ctx=ast.Load()),
+            value=ast.Call(
+                func=ast.Name(id='getattr', ctx=ast.Load()),
+                args=[
+                    ast.Name(id=module_var, ctx=ast.Load()),
+                    ast.Name(id=key_var, ctx=ast.Load()),
+                ],
+                keywords=[],
+            ),
+            generators=[
+                ast.comprehension(
+                    target=ast.Name(id=key_var, ctx=ast.Store()),
+                    iter=names_iter,
+                    ifs=[],
+                    is_async=0,
+                ),
+            ],
+        )
+        stmts.append(
+            ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Call(
+                            func=ast.Name(id='globals', ctx=ast.Load()),
+                            args=[], keywords=[],
+                        ),
+                        attr='update',
+                        ctx=ast.Load(),
+                    ),
+                    args=[update_dict],
+                    keywords=[],
+                ),
+            )
+        )
+        return stmts
     for import_name in stmt.names:
         name, as_name = import_name.name, import_name.asname
         if as_name is None:

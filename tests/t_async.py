@@ -203,3 +203,45 @@ async def consume_with_result():
 
 
 print(asyncio.run(consume_with_result()))
+
+
+
+# Regression: bare `try: return X; finally: ...` in an async function.
+# The fast path used to keep the try at the lambda level, where the
+# return short-circuits send() and the value gets yielded to asyncio.
+async def coro_try_return_finally():
+    try:
+        return "inner-try"
+    finally:
+        pass
+
+
+print(asyncio.run(coro_try_return_finally()))
+
+
+# Regression: try with await + return in body, plus finally. The
+# nonlocal pre-pass was boxing the awaited result onto the outer
+# func helper, so the state machine could not find it.
+async def coro_try_await_return_finally():
+    try:
+        x = await asyncio.sleep(0, result="awaited")
+        return x
+    finally:
+        pass
+
+
+print(asyncio.run(coro_try_await_return_finally()))
+
+
+# Regression: `as e` in a coroutine try crossing await. The except
+# handler block needs its dispatcher seen by the body before the body
+# is emitted.
+async def coro_try_except_await():
+    try:
+        await asyncio.sleep(0)
+        raise ValueError("v")
+    except ValueError as e:
+        return ("caught", str(e))
+
+
+print(asyncio.run(coro_try_except_await()))

@@ -14,7 +14,7 @@ def main():
     if not os.path.exists(args.input):
         print(f'File {args.input} does not exist')
         return
-    with open(args.input) as f:
+    with open(args.input, encoding='utf-8') as f:
         old_code = f.read()
     ast_tree = ast.parse(old_code)
 
@@ -25,7 +25,7 @@ def main():
         if choice.lower() != 'y':
             return
     new_code = ast.unparse(new_tree)
-    with open(args.output, 'w') as f:
+    with open(args.output, 'w', encoding='utf-8') as f:
         f.write(new_code)
 
 

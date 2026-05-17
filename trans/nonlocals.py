@@ -36,9 +36,12 @@ import ast
 
 
 def _is_generator_func(fdef) -> bool:
-    """True iff fdef's body uses yield / yield from directly (not in
-    a nested function or lambda). Mirrors the same predicate in
-    parsers.py — kept local here to avoid an import cycle."""
+    """True iff fdef goes through gen_compile.compile_generator.
+    That happens for: (a) regular def whose body uses yield / yield
+    from directly, (b) any AsyncFunctionDef (we lower coroutines to
+    a state machine too, regardless of whether they yield)."""
+    if isinstance(fdef, ast.AsyncFunctionDef):
+        return True
     class _V(ast.NodeVisitor):
         def __init__(self):
             self.found = False

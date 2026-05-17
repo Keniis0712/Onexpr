@@ -710,3 +710,38 @@ def gen_throw_into_finally():
 
 
 print(gen_throw_into_finally())
+
+
+
+# Regression: simple try/except in generator. Earlier, the try body
+# block was created with the exception handler not yet active in the
+# CFG builder, so the dispatcher never saw the raise.
+def gen_try_simple():
+    def g():
+        try:
+            raise ValueError("boom")
+        except ValueError as e:
+            yield ("caught", str(e))
+        yield "after"
+    return list(g())
+
+
+print(gen_try_simple())
+
+
+# Regression: as-name inside a try whose handler crosses a yield. The
+# handler param `e` is referenced inside the yielded tuple, so the
+# state machine has to capture it on self before yielding.
+def gen_try_as_loop():
+    def g():
+        for i in range(3):
+            try:
+                if i == 1:
+                    raise ValueError(f"v{i}")
+                yield i
+            except ValueError as e:
+                yield ("caught", str(e))
+    return list(g())
+
+
+print(gen_try_as_loop())

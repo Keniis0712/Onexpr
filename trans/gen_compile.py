@@ -896,12 +896,16 @@ class _CFGBuilder:
             current.terminator = TGoto(target=cont)
             return current
         if isinstance(stmt, ast.Try):
-            # Try statement that doesn't cross a yield: emit it
-            # verbatim, the surrounding parse_try in onexpr handles it
-            # at the lambda level. Only when a yield lives inside one
-            # of the clauses do we need to break the try across CFG
-            # blocks.
-            if not _stmt_contains_yield(stmt):
+            # Try statement that doesn't cross a yield AND doesn't
+            # contain a return/break/continue: emit it verbatim, the
+            # surrounding parse_try in onexpr handles it at the lambda
+            # level. Only when a yield lives inside one of the clauses
+            # (or a control-flow stmt that needs to escape the try)
+            # do we need to break the try across CFG blocks.
+            if (
+                not _stmt_contains_yield(stmt)
+                and not _stmt_contains_break_continue_return(stmt)
+            ):
                 current.stmts.append(stmt)
                 return current
             return self._emit_try(stmt, current)
@@ -1121,9 +1125,9 @@ class _CFGBuilder:
         # handler if any.
         dispatcher = self.new_block()
 
+        self.try_stack.append({'handler': dispatcher.id})
         body_entry = self.new_block()
         current.terminator = TGoto(target=body_entry.id)
-        self.try_stack.append({'handler': dispatcher.id})
         body_end = self.emit(stmt.body, body_entry)
         self.try_stack.pop()
 
@@ -1279,8 +1283,6 @@ class _CFGBuilder:
             ]
             dispatcher.terminator = TUnreachable()
 
-        body_entry = self.new_block()
-        current.terminator = TGoto(target=body_entry.id)
         try_entry = {
             'handler': dispatcher.id,
             'finally_entry': finally_entry.id,
@@ -1288,16 +1290,18 @@ class _CFGBuilder:
             'loop_depth_at_push': len(self.loop_stack) - 1,
         }
         self.try_stack.append(try_entry)
+        body_entry = self.new_block()
+        current.terminator = TGoto(target=body_entry.id)
         body_end = self.emit(stmt.body, body_entry)
         self.try_stack.pop()
 
         # else (only if no exception)
         if stmt.orelse:
+            self.try_stack.append(try_entry)
             else_entry = self.new_block()
             if not body_end.is_terminated:
                 body_end.stmts.append(set_outcome('normal'))
                 body_end.terminator = TGoto(target=else_entry.id)
-            self.try_stack.append(try_entry)
             else_end = self.emit(stmt.orelse, else_entry)
             self.try_stack.pop()
             if not else_end.is_terminated:
@@ -1552,6 +1556,31 @@ def _stmt_contains_yield(stmt) -> bool:
             self.found = False
         def visit_Yield(self, node): self.found = True
         def visit_YieldFrom(self, node): self.found = True
+        def visit_Lambda(self, node): pass
+        def visit_FunctionDef(self, node): pass
+        def visit_AsyncFunctionDef(self, node): pass
+        def visit_ClassDef(self, node): pass
+    v = _V()
+    v.visit(stmt)
+    return v.found
+
+
+def _stmt_contains_break_continue_return(stmt) -> bool:
+    """Does this statement contain Break/Continue/Return at the
+    generator-body level (not inside a nested loop/function)?
+
+    For the generator state machine: a try whose body contains any of
+    these must go through the CFG so the surrounding finally/loop can
+    intercept them via outcome routing. Otherwise the fast path keeps
+    the try at the lambda level where Return short-circuits the send
+    method, causing the value to be yielded instead of stop-iterated.
+    """
+    class _V(ast.NodeVisitor):
+        def __init__(self):
+            self.found = False
+        def visit_Return(self, node): self.found = True
+        def visit_Break(self, node): self.found = True
+        def visit_Continue(self, node): self.found = True
         def visit_Lambda(self, node): pass
         def visit_FunctionDef(self, node): pass
         def visit_AsyncFunctionDef(self, node): pass
