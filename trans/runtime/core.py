@@ -137,7 +137,7 @@ def _del_local(name):
 #      _EnumDict whose __setitem__ registers each member as it's set.
 #   3. Move the body's bindings into that namespace via update.
 #   4. Instantiate the class via the chosen metaclass.
-def _make_class(metaclass, name, bases, body_dict):
+def _make_class(metaclass, name, bases, body_dict, **kw):
     if metaclass is type and bases:
         # If the user didn't write metaclass=..., derive it from the
         # bases. Pick the most-derived; raise on incompatible siblings.
@@ -151,9 +151,9 @@ def _make_class(metaclass, name, bases, body_dict):
                     'class must be a (non-strict) subclass of the '
                     'metaclasses of all its bases'
                 )
-    ns = metaclass.__prepare__(name, bases)
+    ns = metaclass.__prepare__(name, bases, **kw)
     ns.update(body_dict)
-    return metaclass(name, bases, ns)
+    return metaclass(name, bases, ns, **kw)
 
 
 # Coroutine plumbing: an `await x` expression in user code lowers to

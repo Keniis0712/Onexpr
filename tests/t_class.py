@@ -53,3 +53,25 @@ child1.age = 10
 child1.greet()
 child1.info = "Alice,15"
 print(child1.info)
+
+# Regression: walrus inside a class body produces a class attribute.
+class WalrusBody:
+    a = (b := 10)
+    c = b * 2
+
+
+print(WalrusBody.a, WalrusBody.b, WalrusBody.c)
+
+
+# Regression: `class C(Base, kw=v)` forwards kw to metaclass +
+# __init_subclass__. PEP 487.
+class _PEP487Base:
+    def __init_subclass__(cls, **kw):
+        cls.kw = kw
+
+
+class _PEP487Child(_PEP487Base, foo='bar', baz=42):
+    pass
+
+
+print(_PEP487Child.kw)

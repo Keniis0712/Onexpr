@@ -997,6 +997,13 @@ def _collect_class_body_names(body: list) -> list:
             for s in node.body:
                 self.visit(s)
 
+        def visit_NamedExpr(self, node):
+            # `(y := expr)` at class-body scope binds y as a class
+            # attribute. Pick up the target so the metaclass dict gets it.
+            if isinstance(node.target, ast.Name):
+                add(node.target.id)
+            self.visit(node.value)
+
         def visit_Import(self, node):
             for alias in node.names:
                 add(alias.asname if alias.asname else alias.name.split('.')[0])
@@ -1082,10 +1089,16 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
     )
 
     metaclass = ast.Name(id='type', ctx=ast.Load())
+    extra_kwargs = []
     for kwd in stmt.keywords:
         if kwd.arg == 'metaclass':
             metaclass = kwd.value
-            break
+        else:
+            # Forward other keywords (tag=..., **kw, etc.) to
+            # _make_class so they reach metaclass.__prepare__ /
+            # __init_subclass__ / metaclass(...) the same way Python
+            # would. PEP 487's __init_subclass__ relies on these.
+            extra_kwargs.append(kwd)
 
     if sub_frame.legacy_return:
         body_or = parse_stmts(cls_body, frame=sub_frame)
@@ -1197,7 +1210,7 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
             ast.Tuple(elts=list(stmt.bases), ctx=ast.Load()),
             body_call,
         ],
-        keywords=[],
+        keywords=extra_kwargs,
     )
 
     return [

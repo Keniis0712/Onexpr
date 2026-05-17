@@ -388,16 +388,23 @@ def _resolve_owners(tree) -> dict:
         is_func = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         if is_func and _is_generator_func(node):
             # Generator function: compile_generator handles its own
-            # boxing through the state-machine class. Don't add this
-            # node to the stack and don't recurse into its body — but
-            # we still need to walk it so any nested non-generator
-            # function inside the generator gets its own analysis. We
-            # pass an empty-ish func_stack from this point so a
-            # nonlocal declaration inside a deeper non-generator
-            # function whose target lives in the generator's body
-            # silently fails to find an owner (which is correct — that
-            # binding is on self, not in any enclosing lambda). For
-            # most user code this is a no-op.
+            # boxing through the state-machine class for the
+            # generator's own locals. But `nonlocal x` inside it
+            # still has to register x with the enclosing owner so
+            # that owner boxes x onto its helper — otherwise the
+            # generator state machine has nowhere to read/write x
+            # from the closure. We resolve the decls here, but only
+            # against enclosing *non-generator* owners. Closure
+            # access from one state machine to another's self is not
+            # implemented.
+            decls = _collect_direct_nonlocal_decls(node)
+            for name in decls:
+                for outer in reversed(func_stack):
+                    if _is_generator_func(outer):
+                        continue
+                    if name in outer._bound_names:
+                        boxed.setdefault(id(outer), set()).add(name)
+                        break
             for child in ast.iter_child_nodes(node):
                 visit(child, func_stack)
         elif is_func:
@@ -493,12 +500,23 @@ def _rewrite(tree, boxed, helper_name_for):
 
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _is_generator_func(node):
-                # Generator function: skip body rewrite. Decorators and
-                # defaults still evaluate in the outer scope, so rewrite
-                # those. Body is left intact for compile_generator —
-                # nested non-generator functions inside the body don't
-                # see boxed names from this layer (which is fine: they
-                # close over send-locals dehydrated by gen_compile).
+                # Generator function: most of the body is rewritten by
+                # compile_generator's SelfRewriter (locals → self.x).
+                # But names declared `nonlocal` here resolve up through
+                # the enclosing scopes to a boxed helper attribute, the
+                # same as in any other inner function. We build a
+                # restricted lookup that only fires for nonlocal-
+                # declared names, leaving everything else for
+                # SelfRewriter.
+                decls = _collect_direct_nonlocal_decls(node)
+                if decls:
+                    def gen_lookup(name, _decls=decls, _outer=lookup):
+                        if name in _decls:
+                            return _outer(name)
+                        return None
+                    node.body = [visit(s, gen_lookup) for s in node.body]
+                # Decorators and defaults still evaluate in the outer
+                # scope — they may reference outer boxed names too.
                 node.decorator_list = [visit(d, lookup) for d in node.decorator_list]
                 node.args.defaults = [visit(d, lookup) for d in node.args.defaults]
                 node.args.kw_defaults = [visit(d, lookup) for d in node.args.kw_defaults]

@@ -614,7 +614,10 @@ def collect_user_locals(body: list, args: ast.arguments) -> set:
     what to box on self.
 
     Doesn't recurse into nested function/class/lambda — those have
-    their own scope."""
+    their own scope. Names declared `nonlocal` or `global` are
+    excluded: those resolve up the closure / module scope and are
+    rewritten to `outer_helper._b_<name>` / `globals()[<name>]` by
+    the nonlocal pre-pass before SelfRewriter runs."""
     names = set()
 
     for group in (args.posonlyargs, args.args, args.kwonlyargs):
@@ -624,6 +627,24 @@ def collect_user_locals(body: list, args: ast.arguments) -> set:
         names.add(args.vararg.arg)
     if args.kwarg is not None:
         names.add(args.kwarg.arg)
+
+    # Collect direct nonlocal / global declarations — those names must
+    # NOT be boxed on self.
+    nonlocal_or_global = set()
+    class _DeclWalker(ast.NodeVisitor):
+        def visit_FunctionDef(self, node): pass
+        def visit_AsyncFunctionDef(self, node): pass
+        def visit_ClassDef(self, node): pass
+        def visit_Lambda(self, node): pass
+        def visit_Nonlocal(self, node):
+            for n in node.names:
+                nonlocal_or_global.add(n)
+        def visit_Global(self, node):
+            for n in node.names:
+                nonlocal_or_global.add(n)
+    dw = _DeclWalker()
+    for stmt in body:
+        dw.visit(stmt)
 
     def add_target(t):
         if isinstance(t, ast.Name):
@@ -701,6 +722,10 @@ def collect_user_locals(body: list, args: ast.arguments) -> set:
     walker = _Walker()
     for stmt in body:
         walker.visit(stmt)
+
+    # Remove names declared nonlocal / global — those resolve up the
+    # closure / module scope, not on self.
+    names -= nonlocal_or_global
 
     return names
 

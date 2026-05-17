@@ -838,3 +838,44 @@ def gen_yfrom_return_value():
 
 
 print(gen_yfrom_return_value())
+
+
+# Regression: generator with `nonlocal x` reads/writes the enclosing
+# function's `x`. The nonlocal pre-pass now resolves the decl against
+# the outer non-generator owner so `x` is boxed there and the generator
+# state machine reads/writes the same slot through the outer helper.
+def gen_nonlocal():
+    def outer():
+        x = 1
+
+        def inner():
+            nonlocal x
+            x += 1
+            yield x
+            x += 10
+            yield x
+
+        return inner()
+
+    return list(outer())
+
+
+print(gen_nonlocal())
+
+
+# Regression: generator with `global x` updates module globals.
+G_GEN = 0
+
+
+def gen_global():
+    def g():
+        global G_GEN
+        G_GEN += 1
+        yield G_GEN
+        G_GEN += 10
+        yield G_GEN
+
+    return (list(g()), G_GEN)
+
+
+print(gen_global())
