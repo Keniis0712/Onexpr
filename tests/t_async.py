@@ -369,3 +369,23 @@ async def annotated_coro(x: int, y: str = "hi") -> tuple[int, str]:
 
 
 print(annotated_coro.__annotations__)
+
+
+# Regression: coroutine forwarder must not be classified as a generator
+# function by frameworks like FastAPI. Internally we implement the
+# coroutine via `types.coroutine(lambda: yield from _Gen_x())`, so the
+# raw lambda has CO_GENERATOR set; without intervention,
+# inspect.isgeneratorfunction returned True and FastAPI's dependency
+# system tried to stream the result. We now stamp CO_COROUTINE
+# (0x80) on _onexpr_code_flags and rely on the inspect._has_code_flag
+# patch (always injected when generator/coroutine functions are
+# present) to surface that.
+import inspect
+
+
+async def coro_for_inspect():
+    return 1
+
+
+print(inspect.isgeneratorfunction(coro_for_inspect))
+print(inspect.iscoroutinefunction(coro_for_inspect))

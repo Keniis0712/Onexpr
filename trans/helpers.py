@@ -297,11 +297,15 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
     if _has_pep695(tree):
         to_insert = to_insert + _get_typealias_body()
 
-    # The inspect monkey-patch only exists to make
-    # inspect.isasyncgenfunction recognise our async-generator
-    # forwarders. Skip the cost when there's no async generator in the
-    # tree.
-    if _has_async_generator(tree):
+    # The inspect monkey-patch helps any tree that contains
+    # generator/coroutine forwarders (sync gen, async gen, or
+    # coroutine) — the forwarders advertise their actual semantics
+    # via _onexpr_code_flags so inspect.isgeneratorfunction etc.
+    # don't misclassify a coroutine forwarder (which is internally a
+    # `yield from` lambda) as a sync generator. Inject whenever the
+    # tree has any generator function so the patch is in place
+    # before the forwarders set their flags.
+    if _has_generator_function(tree):
         to_insert = to_insert + _get_inspect_patch_body()
 
     tree.body = to_insert + tree.body

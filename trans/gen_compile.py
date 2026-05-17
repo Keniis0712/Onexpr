@@ -2080,6 +2080,25 @@ def emit_state_machine(
                 ],
             )
         )
+        # Advertise CO_COROUTINE (0x80) instead of the actual lambda
+        # flags (which include CO_GENERATOR because we use
+        # `yield from` to drive the state machine). Without this
+        # frameworks that probe inspect.isgeneratorfunction first
+        # (FastAPI, dependency injection libraries, …) misclassify
+        # the coroutine as a sync generator and try to stream it.
+        set_name_stmts.append(
+            ast.Assign(
+                targets=[
+                    ast.Attribute(
+                        value=ast.Name(id=raw_name, ctx=ast.Load()),
+                        attr='_onexpr_code_flags',
+                        ctx=ast.Store(),
+                    ),
+                ],
+                # 0x80 == inspect.CO_COROUTINE
+                value=ast.Constant(value=0x80),
+            )
+        )
 
     # Reconstruct forwarder.__annotations__ from the user's parameter
     # annotations + return annotation so introspection (typing.get_type_hints,
