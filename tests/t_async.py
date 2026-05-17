@@ -358,3 +358,14 @@ async def coro_three_deep_nonlocal():
 
 
 print(asyncio.run(coro_three_deep_nonlocal()))
+
+
+# Regression: __annotations__ on async-def forwarders. FastAPI etc.
+# read inspect.signature(endpoint) at decoration time to figure out
+# request parsing — without annotations on the forwarder, every
+# parameter looks like a query parameter.
+async def annotated_coro(x: int, y: str = "hi") -> tuple[int, str]:
+    return (x, y)
+
+
+print(annotated_coro.__annotations__)

@@ -1747,6 +1747,7 @@ def emit_state_machine(
     is_async: bool = False,
     async_kind: str = None,
     gen_self_alias: str = None,
+    returns: ast.expr = None,
 ) -> list:
     """Build a sequence of statements that defines the generator class
     and binds it to `name`. Returned statements are intended to be
@@ -1979,25 +1980,19 @@ def emit_state_machine(
             body=ast.YieldFrom(value=forwarder_call),
         )
 
-    # Apply decorators outside-in (same order as Python's `@deco`).
-    decorated = forwarder
-    for d in reversed(decorator_list):
-        decorated = ast.Call(func=d, args=[decorated], keywords=[])
+    # We build the forwarder, then set __name__/__qualname__/
+    # __annotations__/_is_coroutine_marker on it BEFORE applying user
+    # decorators. Decorators (e.g. FastAPI's @app.get) read these
+    # attributes at decoration time, so getting them on the inner
+    # function is what makes introspection-driven frameworks work.
+    # Bind through a temp name to keep the AST a sequence of stmts.
+    raw_name = '__onexpr_raw_' + name
 
-    bind = ast.Assign(
-        targets=[ast.Name(id=name, ctx=ast.Store())],
-        value=decorated,
+    bind_raw = ast.Assign(
+        targets=[ast.Name(id=raw_name, ctx=ast.Store())],
+        value=forwarder,
     )
 
-    # Set __name__ / __qualname__ on the forwarder so introspection
-    # tools (logging frames, repr() of bound methods, exception
-    # traceback formatting) see the user's name instead of '<lambda>'.
-    # Lambdas have writable __name__ / __qualname__ slots, so a plain
-    # setattr works; types.coroutine returns a wrapper that exposes
-    # the same. We use setattr() rather than direct attribute assign
-    # so an unconfigurable wrapper (rare) silently no-ops via the
-    # try-helper pathway — except we want to avoid pulling in the
-    # try-helper here, so we just do a hasattr check first.
     set_name_stmts = []
     for attr in ('__name__', '__qualname__'):
         set_name_stmts.append(
@@ -2005,7 +2000,7 @@ def emit_state_machine(
                 test=ast.Call(
                     func=ast.Name(id='hasattr', ctx=ast.Load()),
                     args=[
-                        ast.Name(id=name, ctx=ast.Load()),
+                        ast.Name(id=raw_name, ctx=ast.Load()),
                         ast.Constant(value=attr),
                     ],
                     keywords=[],
@@ -2014,7 +2009,7 @@ def emit_state_machine(
                     ast.Assign(
                         targets=[
                             ast.Attribute(
-                                value=ast.Name(id=name, ctx=ast.Load()),
+                                value=ast.Name(id=raw_name, ctx=ast.Load()),
                                 attr=attr, ctx=ast.Store(),
                             ),
                         ],
@@ -2042,7 +2037,7 @@ def emit_state_machine(
             ast.Assign(
                 targets=[
                     ast.Attribute(
-                        value=ast.Name(id=name, ctx=ast.Load()),
+                        value=ast.Name(id=raw_name, ctx=ast.Load()),
                         attr='_onexpr_code_flags',
                         ctx=ast.Store(),
                     ),
@@ -2057,7 +2052,7 @@ def emit_state_machine(
                 test=ast.Call(
                     func=ast.Name(id='hasattr', ctx=ast.Load()),
                     args=[
-                        ast.Name(id=name, ctx=ast.Load()),
+                        ast.Name(id=raw_name, ctx=ast.Load()),
                         ast.Constant(value='_is_coroutine_marker'),
                     ],
                     keywords=[],
@@ -2067,7 +2062,7 @@ def emit_state_machine(
                     ast.Assign(
                         targets=[
                             ast.Attribute(
-                                value=ast.Name(id=name, ctx=ast.Load()),
+                                value=ast.Name(id=raw_name, ctx=ast.Load()),
                                 attr='_is_coroutine_marker',
                                 ctx=ast.Store(),
                             ),
@@ -2086,7 +2081,52 @@ def emit_state_machine(
             )
         )
 
-    return [cls, bind] + set_name_stmts
+    # Reconstruct forwarder.__annotations__ from the user's parameter
+    # annotations + return annotation so introspection (typing.get_type_hints,
+    # FastAPI's signature parsing, dataclasses, pydantic) sees them.
+    # Crucial: the assignment must run BEFORE decorators apply, because
+    # frameworks like FastAPI inspect annotations at decoration time.
+    ann_keys = []
+    ann_values = []
+    for group in (args.posonlyargs, args.args, args.kwonlyargs):
+        for a in group:
+            if a.annotation is not None:
+                ann_keys.append(ast.Constant(value=a.arg))
+                ann_values.append(a.annotation)
+    if args.vararg is not None and args.vararg.annotation is not None:
+        ann_keys.append(ast.Constant(value=args.vararg.arg))
+        ann_values.append(args.vararg.annotation)
+    if args.kwarg is not None and args.kwarg.annotation is not None:
+        ann_keys.append(ast.Constant(value=args.kwarg.arg))
+        ann_values.append(args.kwarg.annotation)
+    if returns is not None:
+        ann_keys.append(ast.Constant(value='return'))
+        ann_values.append(returns)
+    if ann_keys:
+        set_name_stmts.append(
+            ast.Assign(
+                targets=[
+                    ast.Attribute(
+                        value=ast.Name(id=raw_name, ctx=ast.Load()),
+                        attr='__annotations__', ctx=ast.Store(),
+                    ),
+                ],
+                value=ast.Dict(keys=ann_keys, values=ann_values),
+            )
+        )
+
+    # Apply decorators (outside-in, same order as Python's `@deco`)
+    # AFTER all introspection-visible attributes are set.
+    decorated = ast.Name(id=raw_name, ctx=ast.Load())
+    for d in reversed(decorator_list):
+        decorated = ast.Call(func=d, args=[decorated], keywords=[])
+
+    bind = ast.Assign(
+        targets=[ast.Name(id=name, ctx=ast.Store())],
+        value=decorated,
+    )
+
+    return [cls, bind_raw] + set_name_stmts + [bind]
 
 
 def _clone_args_for_forwarder(args: ast.arguments) -> ast.arguments:
@@ -3243,4 +3283,5 @@ def compile_generator(stmt, frame, is_async=False, async_kind=None) -> list:
         decorator_list=stmt.decorator_list,
         async_kind=async_kind,
         gen_self_alias=getattr(stmt, '_gen_self_alias', None),
+        returns=stmt.returns,
     )
