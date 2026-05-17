@@ -745,3 +745,96 @@ def gen_try_as_loop():
 
 
 print(gen_try_as_loop())
+
+
+# Regression: PEP 380 throw forwarding through `yield from`. The
+# outer generator's throw() must propagate the exception to the
+# inner iterator so its except handler runs, and the inner's yielded
+# value surfaces to the outer caller.
+def gen_yfrom_throw():
+    def inner():
+        try:
+            yield 1
+            yield 2
+        except ValueError:
+            yield 'caught-inner'
+
+    def outer():
+        yield from inner()
+        yield 'after'
+
+    out = []
+    gi = outer()
+    out.append(next(gi))
+    out.append(gi.throw(ValueError()))
+    out.append(next(gi))
+    return out
+
+
+print(gen_yfrom_throw())
+
+
+# Regression: PEP 380 send forwarding through `yield from`. send(v)
+# on outer must reach inner.send(v) so the value comes out at
+# inner's `yield` site.
+def gen_yfrom_send():
+    def inner():
+        x = yield 'first'
+        yield ('got', x)
+
+    def outer():
+        yield from inner()
+
+    out = []
+    gi = outer()
+    out.append(next(gi))
+    out.append(gi.send('SENT'))
+    return out
+
+
+print(gen_yfrom_send())
+
+
+# Regression: PEP 380 close forwarding through `yield from`. close()
+# must run finally clauses in *both* the inner generator and the
+# outer (around the yield from itself).
+def gen_yfrom_close():
+    log = []
+
+    def inner():
+        try:
+            yield 1
+            yield 2
+        finally:
+            log.append('inner-fin')
+
+    def outer():
+        try:
+            yield from inner()
+        finally:
+            log.append('outer-fin')
+
+    gi = outer()
+    next(gi)
+    gi.close()
+    return log
+
+
+print(gen_yfrom_close())
+
+
+# Regression: PEP 380 yield-from return value capture survived
+# through `inner.throw` forwarding.
+def gen_yfrom_return_value():
+    def producer():
+        yield 1
+        return 'done'
+
+    def consumer():
+        val = yield from producer()
+        yield ('val', val)
+
+    return list(consumer())
+
+
+print(gen_yfrom_return_value())

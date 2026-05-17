@@ -251,14 +251,21 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
         )
 
         # If the user has an `async def` with `yield` (an async
-        # generator), pull in _AsyncGenWrapper + _async_gen_anext +
-        # the types.coroutine wrap assign.
+        # generator), pull in _AsyncGenWrapper + the per-protocol
+        # forwarders, plus the types.coroutine wrap assigns.
         if _has_async_generator(tree):
-            for n in ('_UserYield', '_AsyncGenWrapper', '_async_gen_anext'):
+            for n in (
+                '_UserYield',
+                '_AsyncGenWrapper',
+                '_async_gen_anext',
+                '_async_gen_asend',
+                '_async_gen_athrow',
+                '_async_gen_aclose',
+            ):
                 if n in core_by_name:
                     to_insert.append(core_by_name[n])
-            # The Assign that wraps _async_gen_anext via types.coroutine
-            # lives in core_extras (it's an Assign, not a def).
+            # Assigns that wrap the four forwarders via types.coroutine
+            # live in core_extras (they're Assigns, not defs).
             for s in core_extras:
                 # All extras are tied to async-gen plumbing right now,
                 # so include them here.

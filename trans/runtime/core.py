@@ -191,6 +191,15 @@ class _AsyncGenWrapper:
     def __anext__(self):
         return _async_gen_anext(self._g)
 
+    def asend(self, value):
+        return _async_gen_asend(self._g, value)
+
+    def athrow(self, typ, val=None, tb=None):
+        return _async_gen_athrow(self._g, typ, val, tb)
+
+    def aclose(self):
+        return _async_gen_aclose(self._g)
+
 
 def _async_gen_anext(g):
     while True:
@@ -207,6 +216,70 @@ def _async_gen_anext(g):
         yield v
 
 
-# Mark _async_gen_anext as a coroutine so `await __anext__()` accepts it.
+def _async_gen_asend(g, value):
+    # First step: send `value` into the body to be received by the
+    # most-recent `yield`. Subsequent steps drive the generator with
+    # plain next() until the next user-level yield.
+    first = True
+    while True:
+        try:
+            if first:
+                v = g.send(value)
+                first = False
+            else:
+                v = next(g)
+        except StopIteration:
+            raise StopAsyncIteration
+        if isinstance(v, _UserYield):
+            return v.v
+        yield v
+
+
+def _async_gen_athrow(g, typ, val=None, tb=None):
+    # Inject the exception at the suspended yield. If the body
+    # catches it and yields again (user-level), surface that value;
+    # otherwise StopIteration → StopAsyncIteration.
+    first = True
+    while True:
+        try:
+            if first:
+                v = g.throw(typ, val, tb)
+                first = False
+            else:
+                v = next(g)
+        except StopIteration:
+            raise StopAsyncIteration
+        if isinstance(v, _UserYield):
+            return v.v
+        yield v
+
+
+def _async_gen_aclose(g):
+    # Inject GeneratorExit. The body's finally clauses run; if the
+    # body swallows GeneratorExit and yields again, that's a
+    # protocol violation (RuntimeError per PEP 525).
+    try:
+        v = g.throw(GeneratorExit)
+    except (GeneratorExit, StopIteration, StopAsyncIteration):
+        return
+    except BaseException:
+        raise
+    if isinstance(v, _UserYield):
+        raise RuntimeError('async generator ignored GeneratorExit')
+    # Intermediate yield from a finally-clause await — keep driving.
+    while True:
+        yield v
+        try:
+            v = next(g)
+        except (GeneratorExit, StopIteration, StopAsyncIteration):
+            return
+        if isinstance(v, _UserYield):
+            raise RuntimeError('async generator ignored GeneratorExit')
+
+
+# Mark generator-protocol forwarders as coroutines so `await` accepts them.
 _async_gen_anext = __import__('types').coroutine(_async_gen_anext)
+_async_gen_asend = __import__('types').coroutine(_async_gen_asend)
+_async_gen_athrow = __import__('types').coroutine(_async_gen_athrow)
+_async_gen_aclose = __import__('types').coroutine(_async_gen_aclose)
 

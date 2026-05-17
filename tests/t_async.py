@@ -245,3 +245,37 @@ async def coro_try_except_await():
 
 
 print(asyncio.run(coro_try_except_await()))
+
+
+# Regression: PEP 525 async generator athrow / aclose / asend.
+# _AsyncGenWrapper used to only implement __aiter__/__anext__.
+async def ag_protocol():
+    out = []
+
+    async def ag():
+        try:
+            yield 1
+            yield 2
+        except ValueError:
+            yield 'caught'
+
+    a = ag()
+    out.append(await a.__anext__())
+    try:
+        v = await a.athrow(ValueError())
+        out.append(v)
+    except StopAsyncIteration:
+        pass
+
+    async def ag2():
+        x = yield 'first'
+        yield ('got', x)
+
+    b = ag2()
+    out.append(await b.__anext__())
+    out.append(await b.asend('SENT'))
+
+    return out
+
+
+print(asyncio.run(ag_protocol()))

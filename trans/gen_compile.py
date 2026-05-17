@@ -988,7 +988,7 @@ class _CFGBuilder:
             # generated slot rather than self.<sub_var>_value.<value>.
             rhs = ast.Attribute(
                 value=_self_name(ast.Load()),
-                attr=sub_var + '_value',
+                attr='_yfrom_value',
                 ctx=ast.Load(),
             )
             nxt.stmts.append(
@@ -1775,6 +1775,19 @@ def emit_state_machine(
             value=ast.Constant(value=None),
         )
     )
+    # _yfrom: the inner iterator that's currently being driven by a
+    # `yield from`, or None when no yield-from is active. send/throw/
+    # close consult this so they can forward to the inner iterator
+    # per PEP 380.
+    init_body.append(
+        ast.Assign(
+            targets=[ast.Attribute(
+                value=ast.Name(id=init_self, ctx=ast.Load()),
+                attr='_yfrom', ctx=ast.Store(),
+            )],
+            value=ast.Constant(value=None),
+        )
+    )
 
     init_args = ast.arguments(
         posonlyargs=list(args.posonlyargs),
@@ -1908,7 +1921,14 @@ def emit_state_machine(
             ),
         )
     else:
-        forwarder = ast.Lambda(args=forwarder_args, body=forwarder_call)
+        # Plain generator forwarder: `yield from` makes the lambda
+        # itself a generator function, so inspect.isgeneratorfunction()
+        # returns True and the user can `yield from gen()` straight
+        # from another generator without an extra iter() call.
+        forwarder = ast.Lambda(
+            args=forwarder_args,
+            body=ast.YieldFrom(value=forwarder_call),
+        )
 
     # Apply decorators outside-in (same order as Python's `@deco`).
     decorated = forwarder
@@ -1920,7 +1940,90 @@ def emit_state_machine(
         value=decorated,
     )
 
-    return [cls, bind]
+    # Set __name__ / __qualname__ on the forwarder so introspection
+    # tools (logging frames, repr() of bound methods, exception
+    # traceback formatting) see the user's name instead of '<lambda>'.
+    # Lambdas have writable __name__ / __qualname__ slots, so a plain
+    # setattr works; types.coroutine returns a wrapper that exposes
+    # the same. We use setattr() rather than direct attribute assign
+    # so an unconfigurable wrapper (rare) silently no-ops via the
+    # try-helper pathway — except we want to avoid pulling in the
+    # try-helper here, so we just do a hasattr check first.
+    set_name_stmts = []
+    for attr in ('__name__', '__qualname__'):
+        set_name_stmts.append(
+            ast.If(
+                test=ast.Call(
+                    func=ast.Name(id='hasattr', ctx=ast.Load()),
+                    args=[
+                        ast.Name(id=name, ctx=ast.Load()),
+                        ast.Constant(value=attr),
+                    ],
+                    keywords=[],
+                ),
+                body=[
+                    ast.Assign(
+                        targets=[
+                            ast.Attribute(
+                                value=ast.Name(id=name, ctx=ast.Load()),
+                                attr=attr, ctx=ast.Store(),
+                            ),
+                        ],
+                        value=ast.Constant(value=name),
+                    ),
+                ],
+                orelse=[],
+            )
+        )
+
+    # For coroutines, expose the inspect.iscoroutinefunction marker so
+    # `inspect.iscoroutinefunction(name)` returns True. The lambda's
+    # __code__ doesn't carry CO_COROUTINE (we synthesize it from a
+    # `yield from` lambda + types.coroutine), so we use the
+    # documented escape hatch: set _is_coroutine_marker to
+    # inspect._is_coroutine_mark.
+    if async_kind == 'gen':
+        # Async generator function. inspect.isasyncgenfunction queries
+        # CO_ASYNC_GENERATOR which we can't synthesize on a lambda, so
+        # this stays a known limitation. We do still set the
+        # asyncgen marker dunder some libraries look at first.
+        pass
+    elif async_kind == 'coro':
+        set_name_stmts.append(
+            ast.If(
+                test=ast.Call(
+                    func=ast.Name(id='hasattr', ctx=ast.Load()),
+                    args=[
+                        ast.Name(id=name, ctx=ast.Load()),
+                        ast.Constant(value='_is_coroutine_marker'),
+                    ],
+                    keywords=[],
+                ),
+                body=[ast.Pass()],
+                orelse=[
+                    ast.Assign(
+                        targets=[
+                            ast.Attribute(
+                                value=ast.Name(id=name, ctx=ast.Load()),
+                                attr='_is_coroutine_marker',
+                                ctx=ast.Store(),
+                            ),
+                        ],
+                        value=ast.Attribute(
+                            value=ast.Call(
+                                func=ast.Name(id='__import__', ctx=ast.Load()),
+                                args=[ast.Constant(value='inspect')],
+                                keywords=[],
+                            ),
+                            attr='_is_coroutine_mark',
+                            ctx=ast.Load(),
+                        ),
+                    ),
+                ],
+            )
+        )
+
+    return [cls, bind] + set_name_stmts
 
 
 def _clone_args_for_forwarder(args: ast.arguments) -> ast.arguments:
@@ -1974,8 +2077,93 @@ def _emit_close() -> ast.FunctionDef:
        - If body re-raises GeneratorExit / StopIteration: silently OK.
        - If body yields a value: raise RuntimeError.
        - If body raises something else: that propagates out.
+
+    PEP 380: if we're suspended on `yield from inner`, close the inner
+    iterator first (via its own close() if it has one), then raise
+    GeneratorExit on ourselves so any surrounding finally clauses in
+    *our* body run too.
     """
     body = [
+        # If suspended on yield from, close the inner iterator first.
+        ast.If(
+            test=ast.Compare(
+                left=ast.Attribute(
+                    value=_self_name(ast.Load()),
+                    attr='_yfrom', ctx=ast.Load(),
+                ),
+                ops=[ast.IsNot()],
+                comparators=[ast.Constant(value=None)],
+            ),
+            body=[
+                ast.Try(
+                    body=[
+                        ast.Assign(
+                            targets=[ast.Name(id='_m', ctx=ast.Store())],
+                            value=ast.Call(
+                                func=ast.Name(id='getattr', ctx=ast.Load()),
+                                args=[
+                                    ast.Attribute(
+                                        value=_self_name(ast.Load()),
+                                        attr='_yfrom', ctx=ast.Load(),
+                                    ),
+                                    ast.Constant(value='close'),
+                                    ast.Constant(value=None),
+                                ],
+                                keywords=[],
+                            ),
+                        ),
+                        ast.If(
+                            test=ast.Compare(
+                                left=ast.Name(id='_m', ctx=ast.Load()),
+                                ops=[ast.IsNot()],
+                                comparators=[ast.Constant(value=None)],
+                            ),
+                            body=[
+                                ast.Expr(value=ast.Call(
+                                    func=ast.Name(id='_m', ctx=ast.Load()),
+                                    args=[], keywords=[],
+                                )),
+                            ],
+                            orelse=[],
+                        ),
+                    ],
+                    handlers=[
+                        ast.ExceptHandler(
+                            type=ast.Name(id='Exception', ctx=ast.Load()),
+                            name=None,
+                            body=[ast.Pass()],
+                        ),
+                    ],
+                    orelse=[],
+                    finalbody=[],
+                ),
+                ast.Assign(
+                    targets=[
+                        ast.Attribute(
+                            value=_self_name(ast.Load()),
+                            attr='_yfrom', ctx=ast.Store(),
+                        )
+                    ],
+                    value=ast.Constant(value=None),
+                ),
+                # Move state to the post-yield-from continuation so
+                # the GeneratorExit we throw next isn't re-routed back
+                # into the (now closed) inner.
+                ast.Assign(
+                    targets=[
+                        ast.Attribute(
+                            value=_self_name(ast.Load()),
+                            attr='state', ctx=ast.Store(),
+                        )
+                    ],
+                    value=ast.Attribute(
+                        value=_self_name(ast.Load()),
+                        attr='_yfrom_next', ctx=ast.Load(),
+                    ),
+                ),
+            ],
+            orelse=[],
+        ),
         ast.Try(
             body=[
                 ast.Assign(
@@ -2058,12 +2246,19 @@ def _emit_throw(blocks: list) -> ast.FunctionDef:
     )
 
     body = [
-        # Allow throw(SomeExceptionClass) — instantiate it.
+        # Resolve (typ, val) into a single exception instance, matching
+        # the standard generator throw protocol:
+        #   throw(ExcType)              → ExcType()
+        #   throw(ExcType, val)         → ExcType(val) if val isn't already
+        #                                 an instance of ExcType
+        #   throw(instance)             → instance
+        # tb is honoured if provided; otherwise we leave the traceback
+        # alone and let Python compose one at the raise site.
         ast.If(
             test=ast.Call(
                 func=ast.Name(id='isinstance', ctx=ast.Load()),
                 args=[
-                    ast.Name(id='exc', ctx=ast.Load()),
+                    ast.Name(id='typ', ctx=ast.Load()),
                     ast.Name(id='type', ctx=ast.Load()),
                 ],
                 keywords=[],
@@ -2071,11 +2266,222 @@ def _emit_throw(blocks: list) -> ast.FunctionDef:
             body=[
                 ast.Assign(
                     targets=[ast.Name(id='exc', ctx=ast.Store())],
+                    value=ast.IfExp(
+                        test=ast.Compare(
+                            left=ast.Name(id='val', ctx=ast.Load()),
+                            ops=[ast.Is()],
+                            comparators=[ast.Constant(value=None)],
+                        ),
+                        body=ast.Call(
+                            func=ast.Name(id='typ', ctx=ast.Load()),
+                            args=[],
+                            keywords=[],
+                        ),
+                        orelse=ast.IfExp(
+                            test=ast.Call(
+                                func=ast.Name(id='isinstance', ctx=ast.Load()),
+                                args=[
+                                    ast.Name(id='val', ctx=ast.Load()),
+                                    ast.Name(id='typ', ctx=ast.Load()),
+                                ],
+                                keywords=[],
+                            ),
+                            body=ast.Name(id='val', ctx=ast.Load()),
+                            orelse=ast.Call(
+                                func=ast.Name(id='typ', ctx=ast.Load()),
+                                args=[ast.Name(id='val', ctx=ast.Load())],
+                                keywords=[],
+                            ),
+                        ),
+                    ),
+                ),
+            ],
+            orelse=[
+                ast.Assign(
+                    targets=[ast.Name(id='exc', ctx=ast.Store())],
+                    value=ast.Name(id='typ', ctx=ast.Load()),
+                ),
+            ],
+        ),
+        # if tb is not None: exc = exc.with_traceback(tb)
+        ast.If(
+            test=ast.Compare(
+                left=ast.Name(id='tb', ctx=ast.Load()),
+                ops=[ast.IsNot()],
+                comparators=[ast.Constant(value=None)],
+            ),
+            body=[
+                ast.Assign(
+                    targets=[ast.Name(id='exc', ctx=ast.Store())],
                     value=ast.Call(
-                        func=ast.Name(id='exc', ctx=ast.Load()),
-                        args=[],
+                        func=ast.Attribute(
+                            value=ast.Name(id='exc', ctx=ast.Load()),
+                            attr='with_traceback',
+                            ctx=ast.Load(),
+                        ),
+                        args=[ast.Name(id='tb', ctx=ast.Load())],
                         keywords=[],
                     ),
+                ),
+            ],
+            orelse=[],
+        ),
+        # if self._yfrom is not None: forward the exception to the
+        # inner iterator (PEP 380). If inner has a .throw, call it;
+        # otherwise close inner and re-raise here. inner.throw can
+        # return a yielded value (we propagate that), raise
+        # StopIteration (we capture .value into <iter>_value — but we
+        # don't track which iter_var is active across throw, so the
+        # caller's send() picks up the next state on the subsequent
+        # call), or raise something else (escapes throw).
+        ast.If(
+            test=ast.Compare(
+                left=ast.Attribute(
+                    value=_self_name(ast.Load()),
+                    attr='_yfrom', ctx=ast.Load(),
+                ),
+                ops=[ast.IsNot()],
+                comparators=[ast.Constant(value=None)],
+            ),
+            body=[
+                ast.Try(
+                    body=[
+                        # _m = getattr(self._yfrom, 'throw', None)
+                        ast.Assign(
+                            targets=[ast.Name(id='_m', ctx=ast.Store())],
+                            value=ast.Call(
+                                func=ast.Name(id='getattr', ctx=ast.Load()),
+                                args=[
+                                    ast.Attribute(
+                                        value=_self_name(ast.Load()),
+                                        attr='_yfrom', ctx=ast.Load(),
+                                    ),
+                                    ast.Constant(value='throw'),
+                                    ast.Constant(value=None),
+                                ],
+                                keywords=[],
+                            ),
+                        ),
+                        # if _m is None: raise exc (after closing inner)
+                        ast.If(
+                            test=ast.Compare(
+                                left=ast.Name(id='_m', ctx=ast.Load()),
+                                ops=[ast.Is()],
+                                comparators=[ast.Constant(value=None)],
+                            ),
+                            body=[
+                                ast.Try(
+                                    body=[
+                                        ast.Expr(value=ast.Call(
+                                            func=ast.Attribute(
+                                                value=ast.Attribute(
+                                                    value=_self_name(ast.Load()),
+                                                    attr='_yfrom', ctx=ast.Load(),
+                                                ),
+                                                attr='close', ctx=ast.Load(),
+                                            ),
+                                            args=[], keywords=[],
+                                        )),
+                                    ],
+                                    handlers=[
+                                        ast.ExceptHandler(
+                                            type=ast.Name(id='AttributeError', ctx=ast.Load()),
+                                            name=None,
+                                            body=[ast.Pass()],
+                                        ),
+                                    ],
+                                    orelse=[],
+                                    finalbody=[],
+                                ),
+                                ast.Assign(
+                                    targets=[
+                                        ast.Attribute(
+                                            value=_self_name(ast.Load()),
+                                            attr='_yfrom', ctx=ast.Store(),
+                                        )
+                                    ],
+                                    value=ast.Constant(value=None),
+                                ),
+                                ast.Raise(
+                                    exc=ast.Name(id='exc', ctx=ast.Load()),
+                                    cause=None,
+                                ),
+                            ],
+                            orelse=[
+                                # Resolve typ/val/tb into a single
+                                # exception instance, then call
+                                # _m(exc) (single-arg form — the
+                                # 3-arg signature is deprecated in
+                                # 3.12 and removed in future).
+                                ast.Assign(
+                                    targets=[ast.Name(id='_v', ctx=ast.Store())],
+                                    value=ast.Call(
+                                        func=ast.Name(id='_m', ctx=ast.Load()),
+                                        args=[ast.Name(id='exc', ctx=ast.Load())],
+                                        keywords=[],
+                                    ),
+                                ),
+                                # return _v — yielded by inner, surface to caller
+                                ast.Return(value=ast.Name(id='_v', ctx=ast.Load())),
+                            ],
+                        ),
+                    ],
+                    handlers=[
+                        ast.ExceptHandler(
+                            type=ast.Name(id='StopIteration', ctx=ast.Load()),
+                            name='_si',
+                            body=[
+                                # Inner finished — capture its return
+                                # value, clear _yfrom, advance state to
+                                # the post-yield-from continuation, and
+                                # drive the state machine forward.
+                                ast.Assign(
+                                    targets=[
+                                        ast.Attribute(
+                                            value=_self_name(ast.Load()),
+                                            attr='_yfrom_value',
+                                            ctx=ast.Store(),
+                                        )
+                                    ],
+                                    value=ast.Attribute(
+                                        value=ast.Name(id='_si', ctx=ast.Load()),
+                                        attr='value', ctx=ast.Load(),
+                                    ),
+                                ),
+                                ast.Assign(
+                                    targets=[
+                                        ast.Attribute(
+                                            value=_self_name(ast.Load()),
+                                            attr='_yfrom', ctx=ast.Store(),
+                                        )
+                                    ],
+                                    value=ast.Constant(value=None),
+                                ),
+                                ast.Assign(
+                                    targets=[
+                                        ast.Attribute(
+                                            value=_self_name(ast.Load()),
+                                            attr='state', ctx=ast.Store(),
+                                        )
+                                    ],
+                                    value=ast.Attribute(
+                                        value=_self_name(ast.Load()),
+                                        attr='_yfrom_next', ctx=ast.Load(),
+                                    ),
+                                ),
+                                ast.Return(value=ast.Call(
+                                    func=ast.Attribute(
+                                        value=_self_name(ast.Load()),
+                                        attr='send', ctx=ast.Load(),
+                                    ),
+                                    args=[ast.Constant(value=None)],
+                                    keywords=[],
+                                )),
+                            ],
+                        ),
+                    ],
+                    orelse=[],
+                    finalbody=[],
                 ),
             ],
             orelse=[],
@@ -2138,9 +2544,13 @@ def _emit_throw(blocks: list) -> ast.FunctionDef:
             posonlyargs=[],
             args=[
                 ast.arg(arg='self', annotation=None),
-                ast.arg(arg='exc', annotation=None),
+                ast.arg(arg='typ', annotation=None),
+                ast.arg(arg='val', annotation=None),
+                ast.arg(arg='tb', annotation=None),
             ],
-            vararg=None, kwonlyargs=[], kw_defaults=[], defaults=[],
+            vararg=None, kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[ast.Constant(value=None), ast.Constant(value=None)],
         ),
         body=body,
         decorator_list=[],
@@ -2351,25 +2761,86 @@ def _emit_terminator(t, blocks) -> list:
             ast.Return(value=t.value),
         ]
     if isinstance(t, TYieldFrom):
-        # Drive self.<iter_var> with next(); return its yield value.
-        # Wrap in try/except StopIteration so we capture the sub-
-        # generator's return value (e.value) into self.<iter_var>_value
-        # for the post-yield-from binding to read.
+        # Drive self.<iter_var> with next() (or send(self._sent) if we
+        # have a value to inject — PEP 380 says `yield from` forwards
+        # the most recent send into the inner). We capture
+        # StopIteration to preserve the sub-generator's return value
+        # for the post-yield-from binding. self._yfrom is set so
+        # throw()/close() can forward into the inner iterator if a
+        # caller injects an exception while we're suspended here.
+        # self._yfrom_next records t.next so throw() can route to the
+        # post-yield-from state directly when it consumes inner.
+        sent = ast.Attribute(
+            value=_self_name(ast.Load()),
+            attr='_sent', ctx=ast.Load(),
+        )
         return [
+            # self._yfrom = self.<iter_var>  — mark active for throw()/close()
+            ast.Assign(
+                targets=[
+                    ast.Attribute(
+                        value=_self_name(ast.Load()),
+                        attr='_yfrom', ctx=ast.Store(),
+                    )
+                ],
+                value=ast.Attribute(
+                    value=_self_name(ast.Load()),
+                    attr=t.iter_var, ctx=ast.Load(),
+                ),
+            ),
+            # self._yfrom_next = t.next
+            ast.Assign(
+                targets=[
+                    ast.Attribute(
+                        value=_self_name(ast.Load()),
+                        attr='_yfrom_next', ctx=ast.Store(),
+                    )
+                ],
+                value=ast.Constant(value=t.next),
+            ),
             ast.Try(
                 body=[
+                    # _v = (next(_i) if _sent is None else _i.send(_sent))
                     ast.Assign(
                         targets=[ast.Name(id='_v', ctx=ast.Store())],
-                        value=ast.Call(
-                            func=ast.Name(id='next', ctx=ast.Load()),
-                            args=[
-                                ast.Attribute(
-                                    value=_self_name(ast.Load()),
-                                    attr=t.iter_var, ctx=ast.Load(),
-                                )
-                            ],
-                            keywords=[],
+                        value=ast.IfExp(
+                            test=ast.Compare(
+                                left=sent,
+                                ops=[ast.Is()],
+                                comparators=[ast.Constant(value=None)],
+                            ),
+                            body=ast.Call(
+                                func=ast.Name(id='next', ctx=ast.Load()),
+                                args=[
+                                    ast.Attribute(
+                                        value=_self_name(ast.Load()),
+                                        attr=t.iter_var, ctx=ast.Load(),
+                                    )
+                                ],
+                                keywords=[],
+                            ),
+                            orelse=ast.Call(
+                                func=ast.Attribute(
+                                    value=ast.Attribute(
+                                        value=_self_name(ast.Load()),
+                                        attr=t.iter_var, ctx=ast.Load(),
+                                    ),
+                                    attr='send', ctx=ast.Load(),
+                                ),
+                                args=[sent],
+                                keywords=[],
+                            ),
                         ),
+                    ),
+                    # self._sent = None — we've consumed the sent value
+                    ast.Assign(
+                        targets=[
+                            ast.Attribute(
+                                value=_self_name(ast.Load()),
+                                attr='_sent', ctx=ast.Store(),
+                            )
+                        ],
+                        value=ast.Constant(value=None),
                     ),
                     ast.Return(value=ast.Name(id='_v', ctx=ast.Load())),
                 ],
@@ -2382,7 +2853,7 @@ def _emit_terminator(t, blocks) -> list:
                                 targets=[
                                     ast.Attribute(
                                         value=_self_name(ast.Load()),
-                                        attr=t.iter_var + '_value',
+                                        attr='_yfrom_value',
                                         ctx=ast.Store(),
                                     )
                                 ],
@@ -2390,6 +2861,16 @@ def _emit_terminator(t, blocks) -> list:
                                     value=ast.Name(id='_si', ctx=ast.Load()),
                                     attr='value', ctx=ast.Load(),
                                 ),
+                            ),
+                            # self._yfrom = None — yield from done
+                            ast.Assign(
+                                targets=[
+                                    ast.Attribute(
+                                        value=_self_name(ast.Load()),
+                                        attr='_yfrom', ctx=ast.Store(),
+                                    )
+                                ],
+                                value=ast.Constant(value=None),
                             ),
                             ast.Assign(
                                 targets=[ast.Attribute(

@@ -182,3 +182,25 @@ def conditional_loop_break(xs, max_iter):
 print(conditional_loop_break([1, 2, 3, 4, 5], 3))
 print(conditional_loop_break([1, 2, -3, 4], 10))
 print(conditional_loop_break([1, 2, 3], 10))
+
+
+# Regression: __name__ / __qualname__ on generator/coroutine
+# forwarders. The lambda forwarder used to expose '<lambda>'.
+def gen():
+    yield 1
+
+
+print(gen.__name__, gen.__qualname__)
+
+
+async def coro():
+    return 1
+
+
+print(coro.__name__)
+
+
+import inspect
+
+print(inspect.isgeneratorfunction(gen))
+print(inspect.iscoroutinefunction(coro))
