@@ -362,6 +362,19 @@ def parse_async_function_def(stmt: ast.AsyncFunctionDef, frame: Frame) -> list[_
     # in types.coroutine. (See gen_compile.emit_state_machine for
     # the coroutine forwarder shape.)
     is_async_gen = _body_has_yield_or_yield_from(stmt.body)
+    if is_async_gen:
+        # Wrap every user-level `yield V` (and `yield from X`) in
+        # _UserYield(...) so the _AsyncGenWrapper.__anext__ coroutine
+        # can distinguish user yields from intermediate yields that
+        # come out of `await` (which we lower to `yield from
+        # _await_iter(x)` further down). Done before await rewriting
+        # so we can tell them apart.
+        _wrap_user_yields(stmt.body)
+    # Lower async comprehensions sitting at the top of a stmt
+    # (Return / Assign / Expr) into explicit async-for loops over
+    # an accumulator. Doesn't handle async comp nested inside larger
+    # expressions — those stay an unimplemented edge case.
+    stmt.body = _lower_async_comps(stmt.body)
     stmt.body = _lower_async_constructs(stmt.body)
     _rewrite_await_in_body(stmt.body)
     if not _body_has_yield_or_yield_from(stmt.body):
@@ -625,6 +638,246 @@ def _lower_async_with(stmt: ast.AsyncWith) -> list:
         finalbody=final_body,
     )
     return setup + [try_node]
+
+
+def _is_async_comp(expr):
+    if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+        return any(g.is_async for g in expr.generators)
+    return False
+
+
+def _lower_async_comp_to_stmts(comp, target_var):
+    """Lower a list/set/dict/generator comprehension that uses
+    `async for` somewhere into a sequence of statements that build
+    the collection in `target_var`. The comp's generators may mix
+    sync and async for; `async for` becomes a real async-for stmt,
+    sync `for` stays sync; ifs become If guards. Nested comps inside
+    the elt are not lowered here (they'd need their own pass)."""
+
+    if isinstance(comp, ast.ListComp):
+        init = ast.Assign(
+            targets=[ast.Name(id=target_var, ctx=ast.Store())],
+            value=ast.List(elts=[], ctx=ast.Load()),
+        )
+        emit = lambda elt: ast.Expr(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=target_var, ctx=ast.Load()),
+                    attr='append', ctx=ast.Load(),
+                ),
+                args=[elt], keywords=[],
+            )
+        )
+    elif isinstance(comp, ast.SetComp):
+        init = ast.Assign(
+            targets=[ast.Name(id=target_var, ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Name(id='set', ctx=ast.Load()),
+                args=[], keywords=[],
+            ),
+        )
+        emit = lambda elt: ast.Expr(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=target_var, ctx=ast.Load()),
+                    attr='add', ctx=ast.Load(),
+                ),
+                args=[elt], keywords=[],
+            )
+        )
+    elif isinstance(comp, ast.DictComp):
+        init = ast.Assign(
+            targets=[ast.Name(id=target_var, ctx=ast.Store())],
+            value=ast.Dict(keys=[], values=[]),
+        )
+        emit = lambda kv: ast.Assign(
+            targets=[ast.Subscript(
+                value=ast.Name(id=target_var, ctx=ast.Load()),
+                slice=kv[0], ctx=ast.Store(),
+            )],
+            value=kv[1],
+        )
+    else:
+        # GeneratorExp with async — Python's GeneratorExp doesn't
+        # accept async-for in a sync function. Lower to a list (most
+        # common consumer) — semantics differ slightly (eager vs
+        # lazy) but it's the closest we can do without a custom
+        # async-genexp class.
+        init = ast.Assign(
+            targets=[ast.Name(id=target_var, ctx=ast.Store())],
+            value=ast.List(elts=[], ctx=ast.Load()),
+        )
+        emit = lambda elt: ast.Expr(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=target_var, ctx=ast.Load()),
+                    attr='append', ctx=ast.Load(),
+                ),
+                args=[elt], keywords=[],
+            )
+        )
+
+    if isinstance(comp, ast.DictComp):
+        elt_payload = (comp.key, comp.value)
+    else:
+        elt_payload = comp.elt
+
+    # Build nested for/async-for loops from generators.
+    inner = [emit(elt_payload)]
+    for gen in reversed(comp.generators):
+        # if guards
+        for if_ in reversed(gen.ifs):
+            inner = [ast.If(test=if_, body=inner, orelse=[])]
+        if gen.is_async:
+            loop = ast.AsyncFor(
+                target=gen.target, iter=gen.iter,
+                body=inner, orelse=[],
+            )
+        else:
+            loop = ast.For(
+                target=gen.target, iter=gen.iter,
+                body=inner, orelse=[],
+            )
+        inner = [loop]
+
+    return [init] + inner
+
+
+def _lower_async_comps(body):
+    """Walk body: when a top-level Return/Assign/Expr has an async
+    comprehension as its (root) value, lower the comp to a build-up
+    block. Doesn't handle async comp nested inside larger expressions
+    — that's a known limitation."""
+    out = []
+    counter = [0]
+
+    def fresh():
+        counter[0] += 1
+        return f'_acomp_{counter[0]}'
+
+    def lower_value_if_comp(value):
+        if _is_async_comp(value):
+            tmp = fresh()
+            return _lower_async_comp_to_stmts(value, tmp), ast.Name(id=tmp, ctx=ast.Load())
+        return None, value
+
+    for stmt in body:
+        if isinstance(stmt, ast.Return) and stmt.value is not None:
+            stmts, replacement = lower_value_if_comp(stmt.value)
+            if stmts is not None:
+                out.extend(stmts)
+                stmt.value = replacement
+            out.append(stmt)
+            continue
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            stmts, replacement = lower_value_if_comp(stmt.value)
+            if stmts is not None:
+                out.extend(stmts)
+                stmt.value = replacement
+            out.append(stmt)
+            continue
+        if isinstance(stmt, ast.Expr):
+            stmts, replacement = lower_value_if_comp(stmt.value)
+            if stmts is not None:
+                out.extend(stmts)
+                stmt.value = replacement
+            out.append(stmt)
+            continue
+        # Compound stmts: recurse into bodies.
+        if isinstance(stmt, ast.If):
+            stmt.body = _lower_async_comps(stmt.body)
+            stmt.orelse = _lower_async_comps(stmt.orelse)
+            out.append(stmt)
+            continue
+        if isinstance(stmt, (ast.For, ast.AsyncFor)):
+            stmt.body = _lower_async_comps(stmt.body)
+            stmt.orelse = _lower_async_comps(stmt.orelse)
+            out.append(stmt)
+            continue
+        if isinstance(stmt, ast.While):
+            stmt.body = _lower_async_comps(stmt.body)
+            stmt.orelse = _lower_async_comps(stmt.orelse)
+            out.append(stmt)
+            continue
+        if isinstance(stmt, ast.Try):
+            stmt.body = _lower_async_comps(stmt.body)
+            for h in stmt.handlers:
+                h.body = _lower_async_comps(h.body)
+            stmt.orelse = _lower_async_comps(stmt.orelse)
+            stmt.finalbody = _lower_async_comps(stmt.finalbody)
+            out.append(stmt)
+            continue
+        if isinstance(stmt, (ast.With, ast.AsyncWith)):
+            stmt.body = _lower_async_comps(stmt.body)
+            out.append(stmt)
+            continue
+        out.append(stmt)
+    return out
+
+
+def _wrap_user_yields(body):
+    """Wrap every `yield V` and `yield from X` in the generator body
+    with _UserYield(...) so the async-generator anext coroutine can
+    distinguish them from yields produced by `await` lowering. Doesn't
+    descend into nested def / class / lambda."""
+    class _R(ast.NodeTransformer):
+        def visit_Yield(self, node):
+            self.generic_visit(node)
+            v = node.value if node.value is not None else ast.Constant(value=None)
+            return ast.Yield(
+                value=ast.Call(
+                    func=ast.Name(id='_UserYield', ctx=ast.Load()),
+                    args=[v],
+                    keywords=[],
+                )
+            )
+
+        def visit_YieldFrom(self, node):
+            # `yield from X` in an async generator iterates X and
+            # yields each value as a user-level yield. We can't keep
+            # YieldFrom directly because the wrapper would only see
+            # the iter values without our marker. Lower it to a for
+            # loop with explicit yield.
+            self.generic_visit(node)
+            # Use a fresh-ish name; we don't have a name_provider in
+            # this transform's scope, so use one tied to id(node).
+            it_var = '_yfrom_' + str(id(node))[-6:]
+            elt = '_yfrom_e_' + str(id(node))[-6:]
+            # Emit as a list of stmts wrapped via a synthetic
+            # marker the caller will splice. Returning a list of
+            # statements from a NodeTransformer requires returning
+            # an Expr containing a synthetic indicator — instead,
+            # we replace YieldFrom with a yielded Subscript of
+            # ((iter_setup_expr_or_pass), yield_loop, None)[2] which
+            # is awkward. Simpler: keep it as a YieldFrom for now
+            # and wrap the value at runtime via a generator
+            # comprehension inside the YieldFrom.
+            return ast.YieldFrom(
+                value=ast.GeneratorExp(
+                    elt=ast.Call(
+                        func=ast.Name(id='_UserYield', ctx=ast.Load()),
+                        args=[ast.Name(id='_v', ctx=ast.Load())],
+                        keywords=[],
+                    ),
+                    generators=[
+                        ast.comprehension(
+                            target=ast.Name(id='_v', ctx=ast.Store()),
+                            iter=node.value,
+                            ifs=[],
+                            is_async=0,
+                        )
+                    ],
+                )
+            )
+
+        def visit_FunctionDef(self, node): return node
+        def visit_AsyncFunctionDef(self, node): return node
+        def visit_ClassDef(self, node): return node
+        def visit_Lambda(self, node): return node
+
+    r = _R()
+    for i, s in enumerate(body):
+        body[i] = r.visit(s)
 
 
 def _rewrite_await_in_body(body):

@@ -121,3 +121,85 @@ async def parallel():
 
 
 print(asyncio.run(parallel()))
+
+
+# Async generator with await between yields
+async def producer_with_await():
+    yield 'a'
+    await asyncio.sleep(0)
+    yield 'b'
+    await asyncio.sleep(0)
+    yield 'c'
+
+
+async def consume_with_await():
+    out = []
+    async for x in producer_with_await():
+        out.append(x)
+    return out
+
+
+print(asyncio.run(consume_with_await()))
+
+
+# Async list comprehension
+async def producer_3():
+    for i in range(3):
+        yield i
+
+
+async def list_comp():
+    return [x * 10 async for x in producer_3()]
+
+
+print(asyncio.run(list_comp()))
+
+
+async def list_comp_filter():
+    return [x async for x in producer_3() if x > 0]
+
+
+print(asyncio.run(list_comp_filter()))
+
+
+# Async dict comprehension
+async def keygen():
+    for k in ('x', 'y', 'z'):
+        yield k
+
+
+async def dict_comp():
+    return {k: ord(k) async for k in keygen()}
+
+
+print(asyncio.run(dict_comp()))
+
+
+# Async set comprehension
+async def set_comp():
+    return {x * x async for x in producer_3()}
+
+
+print(asyncio.run(set_comp()))
+
+
+# Async generator: await result then yield
+async def helper_compute():
+    await asyncio.sleep(0)
+    return 100
+
+
+async def gen_with_await_result():
+    val = await helper_compute()
+    yield val
+    yield val + 1
+
+
+async def consume_with_result():
+    out = []
+    async for x in gen_with_await_result():
+        out.append(x)
+    return out
+
+
+print(asyncio.run(consume_with_result()))

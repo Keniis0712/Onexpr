@@ -172,12 +172,15 @@ def _await_iter(x):
 # Async generator wrapper: an `async def f(): yield V` body becomes
 # a plain generator state machine; we wrap its instance in this
 # class so it satisfies the async iterator protocol (__aiter__ /
-# __anext__). __anext__ is itself a coroutine that pulls one value
-# off the underlying sync generator and returns it as the awaited
-# result. This minimal model only supports async generators whose
-# body contains no `await` — a body that mixes yield and await needs
-# the full async-generator protocol where intermediate awaits
-# propagate through anext, which we don't model yet.
+# __anext__). __anext__ is itself a coroutine that drives the
+# underlying generator until it sees a user-level yield (wrapped in
+# _UserYield), passing through any intermediate yields (from awaits
+# inside the body) to the surrounding scheduler.
+class _UserYield:
+    def __init__(self, v):
+        self.v = v
+
+
 class _AsyncGenWrapper:
     def __init__(self, gen):
         self._g = gen
@@ -190,12 +193,18 @@ class _AsyncGenWrapper:
 
 
 def _async_gen_anext(g):
-    try:
-        v = next(g)
-    except StopIteration:
-        raise StopAsyncIteration
-    return v
-    yield  # noqa — never reached; presence makes this a generator function
+    while True:
+        try:
+            v = next(g)
+        except StopIteration:
+            raise StopAsyncIteration
+        if isinstance(v, _UserYield):
+            return v.v
+        # Not a user yield — this is an intermediate yield from an
+        # `await` somewhere in the async generator's body. Propagate
+        # it to the surrounding scheduler so it can resume us when
+        # the awaited operation completes.
+        yield v
 
 
 # Mark _async_gen_anext as a coroutine so `await __anext__()` accepts it.

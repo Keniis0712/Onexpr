@@ -111,7 +111,7 @@ def _get_core_helper_body() -> list:
     for stmt in body:
         if isinstance(stmt, ast.ClassDef) and stmt.name in (
             func_helper_name, for_helper_name, while_helper_name,
-            '_AsyncGenWrapper',
+            '_AsyncGenWrapper', '_UserYield',
         ):
             if stmt.name in (func_helper_name, for_helper_name, while_helper_name):
                 _mark_legacy_return(stmt)
@@ -254,7 +254,7 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
         # generator), pull in _AsyncGenWrapper + _async_gen_anext +
         # the types.coroutine wrap assign.
         if _has_async_generator(tree):
-            for n in ('_AsyncGenWrapper', '_async_gen_anext'):
+            for n in ('_UserYield', '_AsyncGenWrapper', '_async_gen_anext'):
                 if n in core_by_name:
                     to_insert.append(core_by_name[n])
             # The Assign that wraps _async_gen_anext via types.coroutine
