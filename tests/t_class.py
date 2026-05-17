@@ -75,3 +75,37 @@ class _PEP487Child(_PEP487Base, foo='bar', baz=42):
 
 
 print(_PEP487Child.kw)
+
+
+# Regression: PEP 560 — `class K(typing.NamedTuple): ...` and
+# `class K(Generic[T]): ...` use bases that aren't classes
+# themselves; they expose `__mro_entries__`. _make_class now
+# resolves those into the actual base classes and stashes the
+# original subscripted forms on `__orig_bases__` so the metaclass
+# / __init_subclass__ can read them. Also injects __module__ into
+# the namespace dict because typing.NamedTupleMeta.__new__ requires
+# it.
+from typing import NamedTuple as _NT
+
+
+class _Point(_NT):
+    x: int
+    y: int
+
+
+_p = _Point(1, 2)
+print(_p, _p.x, _p.y, _p[0])
+
+
+from typing import Generic as _Generic, TypeVar as _TypeVar
+
+_T = _TypeVar('_T')
+
+
+class _Container(_Generic[_T]):
+    def __init__(self, v):
+        self.v = v
+
+
+_c = _Container[int](42)
+print(_c.v)

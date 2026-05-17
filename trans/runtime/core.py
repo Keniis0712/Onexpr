@@ -138,6 +138,24 @@ def _del_local(name):
 #   3. Move the body's bindings into that namespace via update.
 #   4. Instantiate the class via the chosen metaclass.
 def _make_class(metaclass, name, bases, body_dict, **kw):
+    # PEP 560: any base that is not itself a class but defines
+    # `__mro_entries__` is replaced by what that method returns. This
+    # is what `__build_class__` does automatically for typing
+    # constructs like `NamedTuple`, `Generic[T]`, `Protocol`,
+    # `TypedDict`, etc. The original bases are stashed in
+    # `__orig_bases__` (PEP 560) so the metaclass / __init_subclass__
+    # can see the subscripted forms.
+    orig_bases = bases
+    new_bases = []
+    used_mro_entries = False
+    for b in bases:
+        if not isinstance(b, type) and hasattr(b, '__mro_entries__'):
+            used_mro_entries = True
+            new_bases.extend(b.__mro_entries__(bases))
+        else:
+            new_bases.append(b)
+    bases = tuple(new_bases)
+
     if metaclass is type and bases:
         # If the user didn't write metaclass=..., derive it from the
         # bases. Pick the most-derived; raise on incompatible siblings.
@@ -152,6 +170,22 @@ def _make_class(metaclass, name, bases, body_dict, **kw):
                     'metaclasses of all its bases'
                 )
     ns = metaclass.__prepare__(name, bases, **kw)
+    # CPython injects __module__ automatically into the class
+    # namespace before running the body. Some metaclasses (e.g.
+    # typing.NamedTupleMeta, EnumMeta) read it during __new__.
+    if '__module__' not in body_dict:
+        import sys as _sys
+        # _getframe(1) is _make_class's caller — i.e. the frame that
+        # holds the user's class statement. Fall back to '__main__'
+        # when sys is somehow not available (it always is in
+        # CPython, so this branch is just defensive).
+        f = _sys._getframe(1) if hasattr(_sys, '_getframe') else None
+        ns['__module__'] = (
+            f.f_globals.get('__name__', '__main__') if f is not None
+            else '__main__'
+        )
+    if used_mro_entries:
+        ns['__orig_bases__'] = orig_bases
     ns.update(body_dict)
     return metaclass(name, bases, ns, **kw)
 
