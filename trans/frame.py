@@ -23,6 +23,13 @@ class Frame:
     # Set when this frame is a class body (so parse_ann_assign knows to
     # write to __annotations__).
     is_class_body: bool = False
+    # Names that this frame's owner FunctionDef has marked as boxed
+    # (try-clause writes, nonlocal targets). parse_import / parse_for
+    # / etc. that synthesize fresh Name(Store) targets at parse time
+    # consult this so the synthesized assignment lands in
+    # helper_var._b_<name> instead of a per-clause-lambda local that
+    # would never be visible elsewhere.
+    boxed_names: Optional[set] = None
 
     def get_temp_var_num(self) -> int:
         if self.temp_var_num is None:

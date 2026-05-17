@@ -202,6 +202,7 @@ def parse_function_def(stmt: ast.FunctionDef, frame: Frame) -> list[_ast.AST]:
         # rewritten Attribute(Name('temp_N'), 'x') references stay correct.
         box_var = getattr(stmt, '_box_helper_var', None)
         sub_frame.func_helper_var = box_var if box_var is not None else sub_frame.get_temp_var()
+    sub_frame.boxed_names = getattr(stmt, '_boxed_names', None)
     return gen_func(stmt, sub_frame)
 
 
@@ -2460,6 +2461,26 @@ def parse_assert(stmt: ast.Assert, frame: Frame) -> list[_ast.AST]:
     ]
 
 
+def _binding_target(frame: Frame, name: str) -> ast.expr:
+    """Build the appropriate Store target for `name` in this frame.
+
+    If the nonlocal pre-pass marked `name` as boxed in the owning
+    function (try-clause assigns, nonlocal-targeted), produce an
+    Attribute on the helper var (`<helper>._b_<name>`). Otherwise fall
+    back to a plain Name. parse_assign and friends turn an
+    Attribute-Store into setattr at the lambda level, so this is
+    the same form _rewrite would have emitted for an existing Name
+    in the original AST.
+    """
+    boxed = frame.boxed_names
+    if boxed is not None and name in boxed and frame.func_helper_var is not None:
+        return ast.Attribute(
+            value=ast.Name(id=frame.func_helper_var, ctx=ast.Load()),
+            attr='_b_' + name, ctx=ast.Store(),
+        )
+    return ast.Name(id=name, ctx=ast.Store())
+
+
 def parse_import(stmt: ast.Import, frame: Frame) -> list[_ast.AST]:
     stmts = []
     for import_name in stmt.names:
@@ -2470,7 +2491,7 @@ def parse_import(stmt: ast.Import, frame: Frame) -> list[_ast.AST]:
             top = name.split('.')[0]
             stmts.append(
                 ast.Assign(
-                    targets=[ast.Name(id=top, ctx=ast.Store())],
+                    targets=[_binding_target(frame, top)],
                     value=ast.Call(
                         func=ast.Name(id='__import__', ctx=ast.Load()),
                         args=[ast.Constant(value=name)],
@@ -2493,7 +2514,7 @@ def parse_import(stmt: ast.Import, frame: Frame) -> list[_ast.AST]:
                 )
             stmts.append(
                 ast.Assign(
-                    targets=[ast.Name(id=as_name, ctx=ast.Store())],
+                    targets=[_binding_target(frame, as_name)],
                     value=value,
                 )
             )
@@ -2503,6 +2524,14 @@ def parse_import(stmt: ast.Import, frame: Frame) -> list[_ast.AST]:
 def parse_import_from(stmt: ast.ImportFrom, frame: Frame) -> list[_ast.AST]:
     stmts = []
     module_var = frame.get_temp_var()
+    # The fromlist is what names we want from the module; passing it
+    # is what causes __import__ to load submodules (e.g.
+    # `from tkinter import ttk` needs fromlist=['ttk'] so ttk is
+    # imported as an attribute of tkinter, not just left missing).
+    if len(stmt.names) == 1 and stmt.names[0].name == '*':
+        from_list = [ast.Constant(value='*')]
+    else:
+        from_list = [ast.Constant(value=n.name) for n in stmt.names]
     stmts.append(
         ast.Assign(
             targets=[ast.Name(id=module_var, ctx=ast.Store())],
@@ -2514,11 +2543,7 @@ def parse_import_from(stmt: ast.ImportFrom, frame: Frame) -> list[_ast.AST]:
                 keywords=[
                     ast.keyword(
                         arg='fromlist',
-                        value=ast.Constant(
-                            [
-                                stmt.module,
-                            ]
-                        ),
+                        value=ast.List(elts=from_list, ctx=ast.Load()),
                     )
                 ],
             ),
@@ -2616,7 +2641,7 @@ def parse_import_from(stmt: ast.ImportFrom, frame: Frame) -> list[_ast.AST]:
             as_name = name
         stmts.append(
             ast.Assign(
-                targets=[ast.Name(id=as_name, ctx=ast.Store())],
+                targets=[_binding_target(frame, as_name)],
                 value=ast.Attribute(
                     value=ast.Name(id=module_var, ctx=ast.Load()),
                     attr=name,

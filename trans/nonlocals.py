@@ -736,6 +736,23 @@ def apply_nonlocal_pass(tree, name_provider, module_helper_var=None, top_frame=N
             func_node._box_helper_var = helper_name[key]
         return helper_name[key]
 
+    # Stash the boxed-name set on each owner FunctionDef /
+    # AsyncFunctionDef so downstream parsers (parse_import,
+    # parse_import_from, parse_for, etc.) that synthesize fresh
+    # Name(Store) targets at parse time can route those assignments
+    # through the helper attribute. Names that were stored in the
+    # original AST were already rewritten to Attribute by _rewrite,
+    # but Name nodes that get *created* later by parse_<stmt> need
+    # this side-channel.
+    def _attach_boxed(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names = boxed.get(id(node))
+            if names:
+                node._boxed_names = set(names)
+        for c in ast.iter_child_nodes(node):
+            _attach_boxed(c)
+    _attach_boxed(tree)
+
     _rewrite(tree, boxed, gen_boxed, helper_name_for)
 
 
