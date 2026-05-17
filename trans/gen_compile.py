@@ -228,13 +228,21 @@ def _is_bare_yield_assign(stmt):
     )
 
 
-def anf_transform(body: list, name_provider) -> list:
+def anf_transform(body: list, name_provider, all_locals=None) -> list:
     """Walk a generator body, returning a new list of statements where
     every Yield / YieldFrom appears either as a top-level expression
     statement or as the entire RHS of a simple-name assignment.
 
     Recurses into If / For / While bodies but stops at nested function
-    / class / lambda — those have their own scopes."""
+    / class / lambda — those have their own scopes.
+
+    `all_locals`, if given, is the full set of names that will be
+    boxed onto self in the final state-machine class (computed by
+    collect_user_locals on the original body). It's used only to
+    dehydrate them as send-local variables right before a nested
+    def/class so the nested scope's closure can reach them; without
+    this, a `def adder(x): return base + x` inside a generator with
+    `base` boxed would see no `base` at all (it's only on self)."""
     out = []
 
     def lift(stmt):
@@ -249,30 +257,33 @@ def anf_transform(body: list, name_provider) -> list:
 
     for stmt in body:
         if isinstance(stmt, ast.Match):
-            # Flatten match → subj-Assign + if/elif chain so the state
-            # machine sees only constructs it knows. compile_match's
-            # output uses walrus operators inside the test expressions
-            # for capture; those have short-circuit semantics that
-            # would break if we lifted them, so we mark the produced
-            # Ifs as match-origin and skip the lift step on them.
             from .match_patterns import compile_match
             fake_frame = _MiniFrame(name_provider)
             flat = compile_match(stmt, fake_frame)
             _mark_match_origin(flat)
-            out.extend(anf_transform(flat, name_provider))
+            out.extend(anf_transform(flat, name_provider, all_locals))
             continue
 
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            # Nested def/class: treat the bound name like any other
-            # user local. The def's own body has its own scope and
-            # goes through the regular onexpr path inside the state-
-            # machine class, so we don't descend.
-            #
-            # Emit `<name> = <name>` with the RHS Name marked so the
-            # state-machine self-rewriter doesn't rewrite it. After
-            # rewrite the LHS becomes `self.<name>` while the RHS
-            # stays as the send-local `<name>` produced by the def
-            # itself. The binding survives across state transitions.
+            # Nested def/class: emit dehydrate-from-self stmts first
+            # so the nested scope's closure can capture boxed user
+            # locals as cell variables. Then the def itself, then a
+            # rebind that boxes the new function/class onto self.
+            if all_locals:
+                free = _free_user_names(stmt, all_locals)
+                for name in sorted(free):
+                    lhs = ast.Name(id=name, ctx=ast.Store())
+                    lhs._gen_no_self = True
+                    out.append(
+                        ast.Assign(
+                            targets=[lhs],
+                            value=ast.Attribute(
+                                value=_self_name(ast.Load()),
+                                attr=name,
+                                ctx=ast.Load(),
+                            ),
+                        )
+                    )
             out.append(stmt)
             rhs = ast.Name(id=stmt.name, ctx=ast.Load())
             rhs._gen_no_self = True
@@ -288,28 +299,56 @@ def anf_transform(body: list, name_provider) -> list:
                 # Match-origin If: recurse into bodies but don't lift
                 # the test, which contains short-circuit walrus
                 # captures we must preserve.
-                stmt.body = anf_transform(stmt.body, name_provider)
-                stmt.orelse = anf_transform(stmt.orelse, name_provider)
+                stmt.body = anf_transform(stmt.body, name_provider, all_locals)
+                stmt.orelse = anf_transform(stmt.orelse, name_provider, all_locals)
                 out.append(stmt)
                 continue
-            stmt.body = anf_transform(stmt.body, name_provider)
-            stmt.orelse = anf_transform(stmt.orelse, name_provider)
+            stmt.body = anf_transform(stmt.body, name_provider, all_locals)
+            stmt.orelse = anf_transform(stmt.orelse, name_provider, all_locals)
             out.extend(lift(stmt))
             continue
         if isinstance(stmt, ast.For):
-            stmt.body = anf_transform(stmt.body, name_provider)
-            stmt.orelse = anf_transform(stmt.orelse, name_provider)
+            # Tuple/list unpack target in a generator's for loop:
+            # rewrite `for a, b in iter:` to
+            #   `for _tmp in iter: a, b = _tmp; <body>`
+            # so the state machine only ever sees a simple Name target.
+            if not isinstance(stmt.target, ast.Name):
+                tmp = name_provider()
+                unpack = ast.Assign(
+                    targets=[stmt.target],
+                    value=ast.Name(id=tmp, ctx=ast.Load()),
+                )
+                stmt.body = [unpack] + stmt.body
+                stmt.target = ast.Name(id=tmp, ctx=ast.Store())
+            stmt.body = anf_transform(stmt.body, name_provider, all_locals)
+            stmt.orelse = anf_transform(stmt.orelse, name_provider, all_locals)
             # The .iter expression itself can contain yield — lift it.
             out.extend(lift(stmt))
             continue
         if isinstance(stmt, ast.While):
-            stmt.body = anf_transform(stmt.body, name_provider)
-            stmt.orelse = anf_transform(stmt.orelse, name_provider)
+            stmt.body = anf_transform(stmt.body, name_provider, all_locals)
+            stmt.orelse = anf_transform(stmt.orelse, name_provider, all_locals)
             out.extend(lift(stmt))
             continue
         out.extend(lift(stmt))
 
     return out
+
+
+def _free_user_names(node, all_locals: set) -> set:
+    """Return the subset of `all_locals` that's referenced (Load ctx)
+    inside `node` (a nested def/class). Descends into the entire
+    subtree because we want to dehydrate any name the nested scope
+    might close over, including in deeply nested expressions."""
+    found = set()
+
+    class _V(ast.NodeVisitor):
+        def visit_Name(self, n):
+            if isinstance(n.ctx, ast.Load) and n.id in all_locals:
+                found.add(n.id)
+
+    _V().visit(node)
+    return found
 
 
 class _MiniFrame:
@@ -440,6 +479,19 @@ def collect_user_locals(body: list, args: ast.arguments) -> set:
 # ---------------------------------------------------------------------
 # CFG construction
 
+def _self_name(ctx=None):
+    """Create a `self` Name marked so _SelfRewriter does not treat it
+    as a user-level boxed local. We use this everywhere emit code
+    references the state-machine instance — without the marker, a
+    user-level parameter literally named `self` (any user-defined
+    method whose generator body lives inside a class) would cause
+    the rewriter to recursively rewrite our own emitted self
+    references into self.self.<...>."""
+    n = ast.Name(id='self', ctx=ctx if ctx is not None else ast.Load())
+    n._gen_no_self = True
+    return n
+
+
 class _CFGBuilder:
     def __init__(self, name_provider):
         self.blocks: list[Block] = []
@@ -531,7 +583,7 @@ class _CFGBuilder:
                 ast.Assign(
                     targets=[ast.Name(id=capture_name, ctx=ast.Store())],
                     value=ast.Attribute(
-                        value=ast.Name(id='self', ctx=ast.Load()),
+                        value=_self_name(ast.Load()),
                         attr='_sent',
                         ctx=ast.Load(),
                     ),
@@ -553,7 +605,7 @@ class _CFGBuilder:
             ast.Assign(
                 targets=[
                     ast.Attribute(
-                        value=ast.Name(id='self', ctx=ast.Load()),
+                        value=_self_name(ast.Load()),
                         attr=sub_var,
                         ctx=ast.Store(),
                     )
@@ -603,15 +655,13 @@ class _CFGBuilder:
             raise NotImplementedError(
                 "for-target must be a simple Name in a generator function"
             )
-        if stmt.orelse:
-            raise NotImplementedError("for-else not supported in generator")
         sub_var = self.name()
         # iter setup goes in current
         current.stmts.append(
             ast.Assign(
                 targets=[
                     ast.Attribute(
-                        value=ast.Name(id='self', ctx=ast.Load()),
+                        value=_self_name(ast.Load()),
                         attr=sub_var,
                         ctx=ast.Store(),
                     )
@@ -625,7 +675,21 @@ class _CFGBuilder:
         )
         head = self.new_block()
         body_b = self.new_block()
-        after = self.new_block()
+        # `after` is what we jump to on exhaustion (no break). If
+        # there's an else, we splice it in between exhaustion and the
+        # join. break goes to `join` directly to skip else.
+        if stmt.orelse:
+            else_b = self.new_block()
+            join = self.new_block()
+            else_end = self.emit(stmt.orelse, else_b)
+            if not else_end.is_terminated:
+                else_end.terminator = TGoto(target=join.id)
+            after = else_b
+            break_target = join
+        else:
+            after = self.new_block()
+            join = after
+            break_target = after
         current.terminator = TGoto(target=head.id)
         head.terminator = TForIter(
             iter_var=sub_var,
@@ -633,29 +697,38 @@ class _CFGBuilder:
             body=body_b.id,
             after=after.id,
         )
-        self.loop_stack.append((head.id, after.id))
+        self.loop_stack.append((head.id, break_target.id))
         end_body = self.emit(stmt.body, body_b)
         self.loop_stack.pop()
         if not end_body.is_terminated:
             end_body.terminator = TGoto(target=head.id)
-        return after
+        return join
 
     def _emit_while(self, stmt, current) -> Block:
-        if stmt.orelse:
-            raise NotImplementedError("while-else not supported in generator")
         head = self.new_block()
         body_b = self.new_block()
-        after = self.new_block()
+        if stmt.orelse:
+            else_b = self.new_block()
+            join = self.new_block()
+            else_end = self.emit(stmt.orelse, else_b)
+            if not else_end.is_terminated:
+                else_end.terminator = TGoto(target=join.id)
+            after = else_b
+            break_target = join
+        else:
+            after = self.new_block()
+            join = after
+            break_target = after
         current.terminator = TGoto(target=head.id)
         head.terminator = TBranch(
             test=stmt.test, true=body_b.id, false=after.id,
         )
-        self.loop_stack.append((head.id, after.id))
+        self.loop_stack.append((head.id, break_target.id))
         end_body = self.emit(stmt.body, body_b)
         self.loop_stack.pop()
         if not end_body.is_terminated:
             end_body.terminator = TGoto(target=head.id)
-        return after
+        return join
 
 
 def _stmt_contains_yield(stmt) -> bool:
@@ -705,7 +778,7 @@ class _SelfRewriter(ast.NodeTransformer):
             return node
         if node.id in self.boxed:
             return ast.Attribute(
-                value=ast.Name(id='self', ctx=ast.Load()),
+                value=_self_name(ast.Load()),
                 attr=node.id,
                 ctx=node.ctx,
             )
@@ -766,15 +839,21 @@ def emit_state_machine(
     spliced into the enclosing scope and processed by parse_stmts /
     parse_class_def normally."""
 
-    # __init__: setattr(self, '<arg>', <arg>) for every parameter,
-    # then setattr(self, 'state', 0) and any housekeeping flags.
+    # __init__: setattr(_inst, '<arg>', <arg>) for every parameter,
+    # then setattr(_inst, 'state', 0) and any housekeeping flags.
+    # We use `_inst` instead of `self` for the init's first parameter
+    # because the user's generator may itself be a method whose first
+    # parameter is named `self` — that would clash with the implicit
+    # `self` we'd otherwise inject. `_inst` avoids the collision and
+    # is never a user-visible name.
+    init_self = '_inst'
     init_body: list = []
     for group in (args.posonlyargs, args.args, args.kwonlyargs):
         for a in group:
             init_body.append(
                 ast.Assign(
                     targets=[ast.Attribute(
-                        value=ast.Name(id='self', ctx=ast.Load()),
+                        value=ast.Name(id=init_self, ctx=ast.Load()),
                         attr=a.arg, ctx=ast.Store(),
                     )],
                     value=ast.Name(id=a.arg, ctx=ast.Load()),
@@ -784,7 +863,7 @@ def emit_state_machine(
         init_body.append(
             ast.Assign(
                 targets=[ast.Attribute(
-                    value=ast.Name(id='self', ctx=ast.Load()),
+                    value=ast.Name(id=init_self, ctx=ast.Load()),
                     attr=args.vararg.arg, ctx=ast.Store(),
                 )],
                 value=ast.Name(id=args.vararg.arg, ctx=ast.Load()),
@@ -794,7 +873,7 @@ def emit_state_machine(
         init_body.append(
             ast.Assign(
                 targets=[ast.Attribute(
-                    value=ast.Name(id='self', ctx=ast.Load()),
+                    value=ast.Name(id=init_self, ctx=ast.Load()),
                     attr=args.kwarg.arg, ctx=ast.Store(),
                 )],
                 value=ast.Name(id=args.kwarg.arg, ctx=ast.Load()),
@@ -803,7 +882,7 @@ def emit_state_machine(
     init_body.append(
         ast.Assign(
             targets=[ast.Attribute(
-                value=ast.Name(id='self', ctx=ast.Load()),
+                value=ast.Name(id=init_self, ctx=ast.Load()),
                 attr='state', ctx=ast.Store(),
             )],
             value=ast.Constant(value=0),
@@ -812,7 +891,7 @@ def emit_state_machine(
     init_body.append(
         ast.Assign(
             targets=[ast.Attribute(
-                value=ast.Name(id='self', ctx=ast.Load()),
+                value=ast.Name(id=init_self, ctx=ast.Load()),
                 attr='_sent', ctx=ast.Store(),
             )],
             value=ast.Constant(value=None),
@@ -821,7 +900,7 @@ def emit_state_machine(
 
     init_args = ast.arguments(
         posonlyargs=list(args.posonlyargs),
-        args=[ast.arg(arg='self', annotation=None)] + list(args.args),
+        args=[ast.arg(arg=init_self, annotation=None)] + list(args.args),
         vararg=args.vararg,
         kwonlyargs=list(args.kwonlyargs),
         kw_defaults=list(args.kw_defaults),
@@ -847,7 +926,7 @@ def emit_state_machine(
             vararg=None,
             kwonlyargs=[], kw_defaults=[], defaults=[],
         ),
-        body=[ast.Return(value=ast.Name(id='self', ctx=ast.Load()))],
+        body=[ast.Return(value=_self_name(ast.Load()))],
         decorator_list=[],
         returns=None,
         type_params=[],
@@ -866,7 +945,7 @@ def emit_state_machine(
             # self._sent = None; return self.send(None)
             ast.Assign(
                 targets=[ast.Attribute(
-                    value=ast.Name(id='self', ctx=ast.Load()),
+                    value=_self_name(ast.Load()),
                     attr='_sent', ctx=ast.Store(),
                 )],
                 value=ast.Constant(value=None),
@@ -874,7 +953,7 @@ def emit_state_machine(
             ast.Return(
                 value=ast.Call(
                     func=ast.Attribute(
-                        value=ast.Name(id='self', ctx=ast.Load()),
+                        value=_self_name(ast.Load()),
                         attr='send', ctx=ast.Load(),
                     ),
                     args=[ast.Constant(value=None)],
@@ -983,7 +1062,7 @@ def _emit_send(blocks: list) -> ast.FunctionDef:
         cur = ast.If(
             test=ast.Compare(
                 left=ast.Attribute(
-                    value=ast.Name(id='self', ctx=ast.Load()),
+                    value=_self_name(ast.Load()),
                     attr='state', ctx=ast.Load(),
                 ),
                 ops=[ast.Eq()],
@@ -1011,7 +1090,7 @@ def _emit_send(blocks: list) -> ast.FunctionDef:
         # self._sent = sent
         ast.Assign(
             targets=[ast.Attribute(
-                value=ast.Name(id='self', ctx=ast.Load()),
+                value=_self_name(ast.Load()),
                 attr='_sent', ctx=ast.Store(),
             )],
             value=ast.Name(id='sent', ctx=ast.Load()),
@@ -1047,7 +1126,7 @@ def _emit_terminator(t, blocks) -> list:
         return [
             ast.Assign(
                 targets=[ast.Attribute(
-                    value=ast.Name(id='self', ctx=ast.Load()),
+                    value=_self_name(ast.Load()),
                     attr='state', ctx=ast.Store(),
                 )],
                 value=ast.Constant(value=t.target),
@@ -1058,7 +1137,7 @@ def _emit_terminator(t, blocks) -> list:
         return [
             ast.Assign(
                 targets=[ast.Attribute(
-                    value=ast.Name(id='self', ctx=ast.Load()),
+                    value=_self_name(ast.Load()),
                     attr='state', ctx=ast.Store(),
                 )],
                 value=ast.IfExp(
@@ -1073,7 +1152,7 @@ def _emit_terminator(t, blocks) -> list:
         return [
             ast.Assign(
                 targets=[ast.Attribute(
-                    value=ast.Name(id='self', ctx=ast.Load()),
+                    value=_self_name(ast.Load()),
                     attr='state', ctx=ast.Store(),
                 )],
                 value=ast.Constant(value=t.next),
@@ -1091,7 +1170,7 @@ def _emit_terminator(t, blocks) -> list:
                     func=ast.Name(id='next', ctx=ast.Load()),
                     args=[
                         ast.Attribute(
-                            value=ast.Name(id='self', ctx=ast.Load()),
+                            value=_self_name(ast.Load()),
                             attr=t.iter_var, ctx=ast.Load(),
                         ),
                         ast.Name(id=_GEN_DONE, ctx=ast.Load()),
@@ -1108,7 +1187,7 @@ def _emit_terminator(t, blocks) -> list:
                 body=[
                     ast.Assign(
                         targets=[ast.Attribute(
-                            value=ast.Name(id='self', ctx=ast.Load()),
+                            value=_self_name(ast.Load()),
                             attr='state', ctx=ast.Store(),
                         )],
                         value=ast.Constant(value=t.next),
@@ -1126,7 +1205,7 @@ def _emit_terminator(t, blocks) -> list:
                     func=ast.Name(id='next', ctx=ast.Load()),
                     args=[
                         ast.Attribute(
-                            value=ast.Name(id='self', ctx=ast.Load()),
+                            value=_self_name(ast.Load()),
                             attr=t.iter_var, ctx=ast.Load(),
                         ),
                         ast.Name(id=_GEN_DONE, ctx=ast.Load()),
@@ -1143,7 +1222,7 @@ def _emit_terminator(t, blocks) -> list:
                 body=[
                     ast.Assign(
                         targets=[ast.Attribute(
-                            value=ast.Name(id='self', ctx=ast.Load()),
+                            value=_self_name(ast.Load()),
                             attr='state', ctx=ast.Store(),
                         )],
                         value=ast.Constant(value=t.after),
@@ -1153,14 +1232,14 @@ def _emit_terminator(t, blocks) -> list:
                 orelse=[
                     ast.Assign(
                         targets=[ast.Attribute(
-                            value=ast.Name(id='self', ctx=ast.Load()),
+                            value=_self_name(ast.Load()),
                             attr=t.target_name, ctx=ast.Store(),
                         )],
                         value=ast.Name(id='_v', ctx=ast.Load()),
                     ),
                     ast.Assign(
                         targets=[ast.Attribute(
-                            value=ast.Name(id='self', ctx=ast.Load()),
+                            value=_self_name(ast.Load()),
                             attr='state', ctx=ast.Store(),
                         )],
                         value=ast.Constant(value=t.body),
@@ -1208,10 +1287,17 @@ def compile_generator(stmt, frame) -> list:
 
     name_provider = frame.get_temp_var
 
-    # 1. ANF-lift any yields embedded in sub-expressions.
-    body = anf_transform(stmt.body, name_provider)
+    # 1. Pre-collect user locals on the original body so ANF knows what
+    #    to dehydrate before nested def/class.
+    prelim_locals = collect_user_locals(stmt.body, stmt.args)
 
-    # 2. Discover locals that need boxing on self.
+    # 2. ANF-lift any yields embedded in sub-expressions, plus flatten
+    #    Match into if-chain, plus stage closure dehydration before
+    #    nested def/class.
+    body = anf_transform(stmt.body, name_provider, all_locals=prelim_locals)
+
+    # 3. Re-discover locals on the rewritten body (ANF may have
+    #    introduced new temp names that also need boxing).
     boxed = collect_user_locals(body, stmt.args)
 
     # 3. Build the CFG.

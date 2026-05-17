@@ -232,3 +232,145 @@ def gen_with_walrus_in_if():
 
 
 print(list(gen_with_walrus_in_if()))
+
+
+def gen_with_match_class():
+    class Pt:
+        __match_args__ = ('x', 'y')
+
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+
+    for p in (Pt(0, 0), Pt(3, 4), Pt(0, 5)):
+        match p:
+            case Pt(0, 0):
+                yield 'origin'
+            case Pt(0, y):
+                yield ('y-axis', y)
+            case Pt(x, y):
+                yield ('point', x, y)
+
+
+print(list(gen_with_match_class()))
+
+
+def gen_with_match_mapping():
+    for d in [{'k': 1}, {'k': 2, 'extra': 'x'}, {}]:
+        match d:
+            case {'k': v}:
+                yield ('k', v)
+            case _:
+                yield 'no-k'
+
+
+print(list(gen_with_match_mapping()))
+
+
+def gen_decorated():
+    yield 'a'
+    yield 'b'
+
+
+def trace(f):
+    f.__traced__ = True
+    return f
+
+
+@trace
+def gen_decorated_real():
+    yield 1
+    yield 2
+
+
+print(list(gen_decorated_real()), gen_decorated_real.__traced__)
+
+
+def gen_yield_from_inner():
+    def inner():
+        yield 'a'
+        yield 'b'
+
+    yield 'start'
+    yield from inner()
+    yield 'end'
+
+
+print(list(gen_yield_from_inner()))
+
+
+def gen_with_for_else():
+    def gen():
+        for x in range(3):
+            if x == 99:
+                break
+            yield x
+        else:
+            yield 'else-ran'
+
+    return list(gen())
+
+
+print(gen_with_for_else())
+
+
+def gen_with_while_else():
+    def gen():
+        i = 0
+        while i < 3:
+            yield i
+            i += 1
+        else:
+            yield 'else-ran'
+
+    return list(gen())
+
+
+print(gen_with_while_else())
+
+
+def gen_with_tuple_target():
+    for a, b in [(1, 2), (3, 4)]:
+        yield a + b
+
+
+print(list(gen_with_tuple_target()))
+
+
+def gen_method_in_generic_class():
+    class Container[T]:
+        def __init__(self, items):
+            self.items = items
+
+        def gen(self):
+            for x in self.items:
+                yield x
+
+    c = Container([1, 2, 3])
+    return list(c.gen())
+
+
+print(gen_method_in_generic_class())
+
+
+def generic_generator():
+    def first[T](items):
+        yield items[0]
+
+    return list(first([1, 2, 3]))
+
+
+print(generic_generator())
+
+
+def gen_closure_over_local():
+    def gen(base):
+        def adder(x):
+            return base + x
+
+        for i in range(3):
+            yield adder(i)
+
+    return list(gen(10))
+
+
+print(gen_closure_over_local())

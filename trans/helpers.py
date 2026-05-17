@@ -120,11 +120,11 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
         or ast.With in detector.presence
         or ast.AsyncWith in detector.presence
     )
-    needs_for = (
-        ast.For in detector.presence
-        or needs_try_runtime
-        or ast.ClassDef in detector.presence  # _make_class iterates bases
-    )
+    # _make_class is always injected (it instantiates every emitted
+    # ClassDef, including the helpers themselves and the generator
+    # state-machine class). Its body uses a for-loop, so we need
+    # _ForHelper unconditionally.
+    needs_for = True
     needs_while = (
         ast.While in detector.presence
         or needs_try_runtime
