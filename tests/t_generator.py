@@ -916,3 +916,24 @@ def gen_pep479_inloop():
 
 
 print(gen_pep479_inloop())
+
+
+# Regression: generator inside generator with `nonlocal x`. Same model
+# as the coroutine-in-coroutine case — outer state machine binds a
+# self-alias and inner uses <alias>.x.
+def gen_in_gen_nonlocal():
+    def outer():
+        x = 'outer'
+
+        def inner():
+            nonlocal x
+            yield x
+            x = 'mod'
+            yield x
+
+        return list(inner())
+
+    return outer()
+
+
+print(gen_in_gen_nonlocal())

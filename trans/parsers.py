@@ -394,7 +394,8 @@ def parse_async_function_def(stmt: ast.AsyncFunctionDef, frame: Frame) -> list[_
         returns=stmt.returns,
         type_params=getattr(stmt, 'type_params', []) or [],
     )
-    for attr in ('_use_legacy_return', '_box_helper_var'):
+    for attr in ('_use_legacy_return', '_box_helper_var',
+                 '_gen_self_alias', '_gen_self_names'):
         if hasattr(stmt, attr):
             setattr(fdef, attr, getattr(stmt, attr))
     from .gen_compile import compile_generator

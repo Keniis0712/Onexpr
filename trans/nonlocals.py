@@ -383,6 +383,12 @@ def _resolve_owners(tree) -> dict:
        is lost when the lambda returns.
     """
     boxed = {}
+    # Names that an enclosed inner generator/coroutine wants to
+    # nonlocal-access on a generator outer. Keyed by id(outer node);
+    # values are sets of names. emit_state_machine reads this off
+    # the outer FunctionDef to decide whether to expose `self` via
+    # a closure alias.
+    gen_boxed = {}
 
     def visit(node, func_stack):
         is_func = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -391,22 +397,29 @@ def _resolve_owners(tree) -> dict:
             # boxing through the state-machine class for the
             # generator's own locals. But `nonlocal x` inside it
             # still has to register x with the enclosing owner so
-            # that owner boxes x onto its helper — otherwise the
-            # generator state machine has nowhere to read/write x
-            # from the closure. We resolve the decls here, but only
-            # against enclosing *non-generator* owners. Closure
-            # access from one state machine to another's self is not
-            # implemented.
+            # that owner boxes x onto its helper / self — otherwise
+            # the generator state machine has nowhere to read/write
+            # x from the closure. Generator owners go into a
+            # separate `gen_boxed` set so emit_state_machine knows
+            # to expose self via a closure alias and the rewriter
+            # rewrites the inner's Name references to <alias>.name
+            # (plain self attribute, not the _b_ helper-prefixed
+            # form).
             decls = _collect_direct_nonlocal_decls(node)
             for name in decls:
                 for outer in reversed(func_stack):
-                    if _is_generator_func(outer):
-                        continue
                     if name in outer._bound_names:
-                        boxed.setdefault(id(outer), set()).add(name)
+                        if _is_generator_func(outer):
+                            gen_boxed.setdefault(id(outer), set()).add(name)
+                        else:
+                            boxed.setdefault(id(outer), set()).add(name)
                         break
+            # Push this generator onto the stack so a deeper inner
+            # function (generator or not) can resolve its own
+            # nonlocal decls back to here.
+            new_stack = func_stack + [node]
             for child in ast.iter_child_nodes(node):
-                visit(child, func_stack)
+                visit(child, new_stack)
         elif is_func:
             decls = _collect_direct_nonlocal_decls(node)
             for name in decls:
@@ -449,7 +462,7 @@ def _resolve_owners(tree) -> dict:
                 visit(child, func_stack)
 
     visit(tree, [])
-    return boxed
+    return boxed, gen_boxed
 
 
 def _comprehension_targets(generators) -> set:
@@ -482,7 +495,7 @@ def _lambda_arg_names(args) -> set:
     return names
 
 
-def _rewrite(tree, boxed, helper_name_for):
+def _rewrite(tree, boxed, gen_boxed, helper_name_for):
     def visit(node, lookup):
         if node is None:
             return None
@@ -490,10 +503,10 @@ def _rewrite(tree, boxed, helper_name_for):
         if isinstance(node, ast.Name):
             hit = lookup(node.id)
             if hit is not None:
-                helper_var, attr = hit
+                helper_var, attr, prefix = hit
                 return ast.Attribute(
                     value=ast.Name(id=helper_var, ctx=ast.Load()),
-                    attr=_BOX_ATTR_PREFIX + attr,
+                    attr=prefix + attr,
                     ctx=node.ctx,
                 )
             return node
@@ -503,17 +516,27 @@ def _rewrite(tree, boxed, helper_name_for):
                 # Generator function: most of the body is rewritten by
                 # compile_generator's SelfRewriter (locals → self.x).
                 # But names declared `nonlocal` here resolve up through
-                # the enclosing scopes to a boxed helper attribute, the
-                # same as in any other inner function. We build a
-                # restricted lookup that only fires for nonlocal-
-                # declared names, leaving everything else for
-                # SelfRewriter.
+                # the enclosing scopes — to a _FuncHelper._b_x for a
+                # plain-function owner, or to <outer_alias>.x for a
+                # generator owner. We build a restricted lookup that
+                # only fires for nonlocal-declared names, leaving
+                # everything else for SelfRewriter.
                 decls = _collect_direct_nonlocal_decls(node)
-                if decls:
-                    def gen_lookup(name, _decls=decls, _outer=lookup):
-                        if name in _decls:
-                            return _outer(name)
-                        return None
+                # Inside this generator's body, also expose its own
+                # gen_boxed names so a deeper inner generator (yet
+                # another nesting level) can hit them via lookup.
+                own_gen_alias = getattr(node, '_gen_self_alias', None)
+                own_gen_names = getattr(node, '_gen_self_names', set())
+
+                def gen_lookup(name, _decls=decls, _outer=lookup,
+                               _alias=own_gen_alias, _own=own_gen_names):
+                    if _alias is not None and name in _own:
+                        return (_alias, name, '')
+                    if name in _decls:
+                        return _outer(name)
+                    return None
+
+                if decls or own_gen_alias is not None:
                     node.body = [visit(s, gen_lookup) for s in node.body]
                 # Decorators and defaults still evaluate in the outer
                 # scope — they may reference outer boxed names too.
@@ -529,7 +552,7 @@ def _rewrite(tree, boxed, helper_name_for):
 
             def new_lookup(name, _parent=lookup, _bound=bound, _box=boxset, _h=local_helper):
                 if name in _box:
-                    return (_h, name)
+                    return (_h, name, _BOX_ATTR_PREFIX)
                 if name in _bound:
                     return None
                 return _parent(name)
@@ -574,7 +597,7 @@ def _rewrite(tree, boxed, helper_name_for):
 
             def class_lookup(name, _parent=lookup, _box=class_boxset, _h=class_helper):
                 if name in _box:
-                    return (_h, name)
+                    return (_h, name, _BOX_ATTR_PREFIX)
                 return _parent(name)
 
             node.decorator_list = [visit(d, lookup) for d in node.decorator_list]
@@ -663,7 +686,7 @@ def apply_nonlocal_pass(tree, name_provider, module_helper_var=None, top_frame=N
     globals() instead of a helper-attribute box.
     """
     _annotate_bound_names(tree)
-    boxed = _resolve_owners(tree)
+    boxed, gen_boxed = _resolve_owners(tree)
 
     # Module-level try-clause assignments: route through globals() so
     # they become real module attributes (visible to subsequent code
@@ -673,7 +696,35 @@ def apply_nonlocal_pass(tree, name_provider, module_helper_var=None, top_frame=N
             if name not in top_frame.global_vars:
                 top_frame.global_vars.append(name)
 
-    if not boxed:
+    # Stash gen_boxed alias names on the outer generator nodes so
+    # gen_compile can read them off the FunctionDef and emit
+    # `<alias> = self` at the start of send().
+    for outer_id, names in gen_boxed.items():
+        # walk to find the AST node with this id — we already have
+        # _bound_names set on it during _annotate_bound_names, so
+        # stash via a side-table keyed by id is enough. But
+        # downstream consumers see the FunctionDef directly, so we
+        # use a plain attribute. Locate the node:
+        pass
+
+    # Walk the tree once to attach gen_boxed names + alias to
+    # FunctionDef / AsyncFunctionDef nodes that are generator
+    # outers with non-empty entries.
+    if gen_boxed:
+        gen_alias = {}
+        def _attach(node):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names = gen_boxed.get(id(node))
+                if names:
+                    alias = name_provider()
+                    gen_alias[id(node)] = alias
+                    node._gen_self_alias = alias
+                    node._gen_self_names = set(names)
+            for child in ast.iter_child_nodes(node):
+                _attach(child)
+        _attach(tree)
+
+    if not boxed and not gen_boxed:
         return  # nothing to do
 
     helper_name = {}
@@ -685,7 +736,7 @@ def apply_nonlocal_pass(tree, name_provider, module_helper_var=None, top_frame=N
             func_node._box_helper_var = helper_name[key]
         return helper_name[key]
 
-    _rewrite(tree, boxed, helper_name_for)
+    _rewrite(tree, boxed, gen_boxed, helper_name_for)
 
 
 def _collect_module_top_try_assigns(tree) -> set:

@@ -316,3 +316,45 @@ async def aio_wait_for_timeout():
 
 
 print(asyncio.run(aio_wait_for_timeout()))
+
+
+# Regression: coroutine inside coroutine with `nonlocal x`. The outer
+# coroutine is also a state machine so plain helper-attribute boxing
+# can't reach it; instead the nonlocal pre-pass marks the outer
+# generator with a self-alias (`_gen_self_alias`) that emit_state_machine
+# binds at the start of send(), and the inner's Name references are
+# rewritten to <alias>.x.
+async def coro_in_coro_nonlocal():
+    x = 0
+
+    async def inner():
+        nonlocal x
+        x += 5
+        return x
+
+    r = await inner()
+    return (r, x)
+
+
+print(asyncio.run(coro_in_coro_nonlocal()))
+
+
+# Three-deep: outer -> inner1 -> inner2 with nonlocal at the outermost.
+async def coro_three_deep_nonlocal():
+    x = 'orig'
+
+    async def inner1():
+        nonlocal x
+
+        async def inner2():
+            nonlocal x
+            x = 'changed'
+            return x
+
+        return await inner2()
+
+    r = await inner1()
+    return (r, x)
+
+
+print(asyncio.run(coro_three_deep_nonlocal()))

@@ -1746,6 +1746,7 @@ def emit_state_machine(
     decorator_list: list,
     is_async: bool = False,
     async_kind: str = None,
+    gen_self_alias: str = None,
 ) -> list:
     """Build a sequence of statements that defines the generator class
     and binds it to `name`. Returned statements are intended to be
@@ -1908,7 +1909,7 @@ def emit_state_machine(
     # send: the actual state machine. while True: dispatch by self.state.
     # Each block becomes a branch; terminators write self.state and
     # either continue (loop again) or return (yield) or raise.
-    send_def = _emit_send(blocks)
+    send_def = _emit_send(blocks, gen_self_alias=gen_self_alias)
     throw_def = _emit_throw(blocks)
     close_def = _emit_close()
 
@@ -2651,7 +2652,7 @@ def _emit_throw(blocks: list) -> ast.FunctionDef:
     )
 
 
-def _emit_send(blocks: list) -> ast.FunctionDef:
+def _emit_send(blocks: list, gen_self_alias: str = None) -> ast.FunctionDef:
     """The state-machine dispatch. Big while True: if/elif chain by
     self.state, wrapped in a try/except that consults a per-state
     handler map for routing exceptions to user except clauses."""
@@ -2858,7 +2859,19 @@ def _emit_send(blocks: list) -> ast.FunctionDef:
             )
         ]
 
-    body = [
+    body = []
+    if gen_self_alias is not None:
+        # Expose `self` under a stable alias name so any nested
+        # generator/coroutine class defined inside this send body
+        # can capture us via closure and resolve `nonlocal x` to
+        # <alias>.x.
+        body.append(
+            ast.Assign(
+                targets=[ast.Name(id=gen_self_alias, ctx=ast.Store())],
+                value=_self_name(ast.Load()),
+            )
+        )
+    body += [
         # self._sent = sent
         ast.Assign(
             targets=[ast.Attribute(
@@ -3229,4 +3242,5 @@ def compile_generator(stmt, frame, is_async=False, async_kind=None) -> list:
         boxed=boxed,
         decorator_list=stmt.decorator_list,
         async_kind=async_kind,
+        gen_self_alias=getattr(stmt, '_gen_self_alias', None),
     )
