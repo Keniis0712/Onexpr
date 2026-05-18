@@ -112,6 +112,26 @@ def emit_state_machine(
         )
     )
 
+    # Initialize all boxed user locals (non-arg names) to None so that
+    # ANF dehydration reads (x = self.x before a nested def/class) never
+    # fail with AttributeError before the first assignment to x.
+    arg_names = {a.arg for group in (args.posonlyargs, args.args, args.kwonlyargs)
+                 for a in group}
+    if args.vararg:
+        arg_names.add(args.vararg.arg)
+    if args.kwarg:
+        arg_names.add(args.kwarg.arg)
+    for lname in sorted(boxed - arg_names):
+        init_body.append(
+            ast.Assign(
+                targets=[ast.Attribute(
+                    value=ast.Name(id=init_self, ctx=ast.Load()),
+                    attr=lname, ctx=ast.Store(),
+                )],
+                value=ast.Constant(value=None),
+            )
+        )
+
     init_args = ast.arguments(
         posonlyargs=list(args.posonlyargs),
         args=[ast.arg(arg=init_self, annotation=None)] + list(args.args),

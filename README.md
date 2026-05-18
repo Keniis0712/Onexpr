@@ -42,8 +42,8 @@ Most modern Python:
 - async: `async def` / `await`, `async for`, `async with`, async generators
   (with `await` between yields plus `asend` / `athrow` / `aclose`), async
   comprehensions.
-- `inspect.isgeneratorfunction` / `iscoroutinefunction` / `isasyncgenfunction`
-  recognise transformed functions correctly.
+- `inspect.isgeneratorfunction` / `iscoroutinefunction` / `isasyncgenfunction` /
+  `isasyncgen` recognise transformed functions and instances correctly.
 - PEP 695 type parameters: `type X = ...`, `def f[T](...)`, `class C[T]:`,
   `ParamSpec`, `TypeVarTuple`, PEP 696 defaults.
 - Imports, `del`, `assert`, runtime annotations, `:=`, augmented assignment,
@@ -56,13 +56,6 @@ Most modern Python:
   slot is set to `None` instead. Module-level `del` works correctly.
 - `for *a, b in ...` (starred tuple-unpack as the loop target) doesn't let
   `a` / `b` escape the loop.
-- Async comprehensions only work as the right-hand side of an assignment or a
-  `return` — not nested inside a larger expression.
-- `inspect.isasyncgen(instance)` returns `False` for our async-generator
-  instances. The check uses `isinstance(obj, types.AsyncGeneratorType)` with a
-  concrete C type, and our wrapper class isn't that type.
-  `inspect.isasyncgenfunction(forwarder)` does work via the `_has_code_flag`
-  patch.
 - We replace `typing.TypeAliasType` with an ABC proxy so
   `isinstance(x, typing.TypeAliasType)` keeps working for both real C instances
   and our duck instances. Side effect: `type(x) is typing.TypeAliasType` becomes

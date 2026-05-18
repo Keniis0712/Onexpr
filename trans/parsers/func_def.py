@@ -566,11 +566,51 @@ def _lower_async_comp_to_stmts(comp, target_var):
     return [init] + inner
 
 
+class _AsyncCompLifter(ast.NodeTransformer):
+    """Lift async comprehensions embedded anywhere inside an expression
+    into fresh pre-stmts. Doesn't descend into nested function/class/
+    lambda bodies (those have their own lowering pass)."""
+
+    def __init__(self, fresh):
+        self._fresh = fresh
+        self.pre_stmts: list = []
+
+    def visit_ListComp(self, node):
+        return self._lift_if_async(node)
+
+    def visit_SetComp(self, node):
+        return self._lift_if_async(node)
+
+    def visit_DictComp(self, node):
+        return self._lift_if_async(node)
+
+    def visit_GeneratorExp(self, node):
+        return self._lift_if_async(node)
+
+    def _lift_if_async(self, node):
+        self.generic_visit(node)
+        if not _is_async_comp(node):
+            return node
+        tmp = self._fresh()
+        self.pre_stmts.extend(_lower_async_comp_to_stmts(node, tmp))
+        return ast.Name(id=tmp, ctx=ast.Load())
+
+    def visit_Lambda(self, node):
+        return node
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        return node
+
+    def visit_ClassDef(self, node):
+        return node
+
+
 def _lower_async_comps(body):
-    """Walk body: when a top-level Return/Assign/Expr has an async
-    comprehension as its (root) value, lower the comp to a build-up
-    block. Doesn't handle async comp nested inside larger expressions
-    — that's a known limitation."""
+    """Walk body and lift async comprehensions out of any expression
+    position into preceding statements."""
     out = []
     counter = [0]
 
@@ -578,41 +618,50 @@ def _lower_async_comps(body):
         counter[0] += 1
         return f'_acomp_{counter[0]}'
 
-    def lower_value_if_comp(value):
-        if _is_async_comp(value):
-            tmp = fresh()
-            return _lower_async_comp_to_stmts(value, tmp), ast.Name(id=tmp, ctx=ast.Load())
-        return None, value
+    def lift_expr(value):
+        """Return (pre_stmts, new_value). pre_stmts may be empty."""
+        lifter = _AsyncCompLifter(fresh)
+        new_value = lifter.visit(value)
+        return lifter.pre_stmts, new_value
 
     for stmt in body:
+        # Statements with an expression value — lift from that value.
         if isinstance(stmt, ast.Return) and stmt.value is not None:
-            stmts, replacement = lower_value_if_comp(stmt.value)
-            if stmts is not None:
-                out.extend(stmts)
-                stmt.value = replacement
+            pre, stmt.value = lift_expr(stmt.value)
+            out.extend(pre)
             out.append(stmt)
             continue
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
-            stmts, replacement = lower_value_if_comp(stmt.value)
-            if stmts is not None:
-                out.extend(stmts)
-                stmt.value = replacement
+        if isinstance(stmt, ast.Assign):
+            pre, stmt.value = lift_expr(stmt.value)
+            out.extend(pre)
+            out.append(stmt)
+            continue
+        if isinstance(stmt, ast.AugAssign):
+            pre, stmt.value = lift_expr(stmt.value)
+            out.extend(pre)
+            out.append(stmt)
+            continue
+        if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            pre, stmt.value = lift_expr(stmt.value)
+            out.extend(pre)
             out.append(stmt)
             continue
         if isinstance(stmt, ast.Expr):
-            stmts, replacement = lower_value_if_comp(stmt.value)
-            if stmts is not None:
-                out.extend(stmts)
-                stmt.value = replacement
+            pre, stmt.value = lift_expr(stmt.value)
+            out.extend(pre)
             out.append(stmt)
             continue
         # Compound stmts: recurse into bodies.
         if isinstance(stmt, ast.If):
+            pre, stmt.test = lift_expr(stmt.test)
+            out.extend(pre)
             stmt.body = _lower_async_comps(stmt.body)
             stmt.orelse = _lower_async_comps(stmt.orelse)
             out.append(stmt)
             continue
         if isinstance(stmt, (ast.For, ast.AsyncFor)):
+            pre, stmt.iter = lift_expr(stmt.iter)
+            out.extend(pre)
             stmt.body = _lower_async_comps(stmt.body)
             stmt.orelse = _lower_async_comps(stmt.orelse)
             out.append(stmt)

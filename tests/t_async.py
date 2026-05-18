@@ -389,3 +389,40 @@ async def coro_for_inspect():
 
 print(inspect.isgeneratorfunction(coro_for_inspect))
 print(inspect.iscoroutinefunction(coro_for_inspect))
+
+
+# inspect.isasyncgen on wrapper instances
+async def gen_for_isasyncgen():
+    yield 1
+
+print(inspect.isasyncgenfunction(gen_for_isasyncgen))
+
+
+async def check_isasyncgen():
+    g = gen_for_isasyncgen()
+    print(inspect.isasyncgen(g))
+
+asyncio.run(check_isasyncgen())
+
+
+# Async comprehension nested inside a larger expression (not just at
+# statement root). Previously only `result = [x async for x in it]`
+# was supported; these cases were not.
+async def aiter_for_comps(items):
+    for x in items:
+        yield x
+
+
+async def nested_async_comps():
+    # Nested in arithmetic
+    a = 10 + len([x * 2 async for x in aiter_for_comps([1, 2, 3])])
+    print(a)
+    # Nested in a tuple literal
+    t = ([x async for x in aiter_for_comps([4, 5])], "hi")
+    print(t)
+    # Dict comp nested
+    d = {k: v async for k, v in aiter_for_comps([("a", 1), ("b", 2)])}
+    print(sorted(d.items()))
+
+
+asyncio.run(nested_async_comps())

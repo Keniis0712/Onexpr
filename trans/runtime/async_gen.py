@@ -93,3 +93,20 @@ _async_gen_anext = __import__('types').coroutine(_async_gen_anext)
 _async_gen_asend = __import__('types').coroutine(_async_gen_asend)
 _async_gen_athrow = __import__('types').coroutine(_async_gen_athrow)
 _async_gen_aclose = __import__('types').coroutine(_async_gen_aclose)
+
+# Patch types.AsyncGeneratorType with an ABC proxy so that
+# inspect.isasyncgen(wrapper_instance) returns True.
+# We replace the C type with an abc.ABCMeta class that has the real
+# C type registered, then register _AsyncGenWrapper too.
+# The proxy's __new__ is never called (nobody constructs the C type
+# from Python), so we don't need to forward it.
+import abc as _abc
+import types as _types
+
+if not isinstance(_types.AsyncGeneratorType, _abc.ABCMeta):
+    class _AsyncGenTypeProxy(metaclass=_abc.ABCMeta):
+        pass
+    _AsyncGenTypeProxy.register(_types.AsyncGeneratorType)
+    _types.AsyncGeneratorType = _AsyncGenTypeProxy
+
+_types.AsyncGeneratorType.register(_AsyncGenWrapper)
