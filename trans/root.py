@@ -1,4 +1,5 @@
 import ast
+import sys
 
 from .frame import Frame
 from .helpers import add_helper
@@ -8,6 +9,19 @@ from .passes import SuperTransformer, collect_user_names
 
 
 def parse_root(tree: ast.Module) -> ast.Module:
+    # The transform recurses through the AST several times — for big
+    # source files (e.g. CPython's own test_grammar.py with very
+    # nested data literals) the default recursion limit can be too
+    # low. The transformed AST is deeper still (every stmt becomes a
+    # nested BoolOp / Subscript / Lambda chain), so callers that
+    # want to ast.unparse() the result need the bumped limit too.
+    # Leave the limit raised — restoring it here would break unparse.
+    if sys.getrecursionlimit() < 5000:
+        sys.setrecursionlimit(5000)
+    return _parse_root_inner(tree)
+
+
+def _parse_root_inner(tree: ast.Module) -> ast.Module:
     # Init the top frame
     top_frame = Frame(None, [], [])
     top_frame.temp_var_num = 0

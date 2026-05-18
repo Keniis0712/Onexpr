@@ -47,22 +47,16 @@ def get_transformed_ast(source):
 
 class TestSuperTransformer(unittest.TestCase):
     def test_simple_class(self):
+        # super() inside a class is now left as-is; the __class__ cell
+        # mechanism in parse_class_def + _make_class handles it at runtime.
         source = '''
 class A:
     def method(self):
         super().method()
 '''
-        expected = '''
-class A:
-    def method(self):
-        super(A, self).method()
-'''
         result_tree = get_transformed_ast(source)
-        expected_tree = ast.parse(expected)
-        self.assertEqual(
-            ast.dump(result_tree),
-            ast.dump(expected_tree)
-        )
+        # super() should remain zero-arg (not rewritten to super(A, self))
+        self.assertIn("super()", ast.unparse(result_tree))
 
     def test_nested_classes(self):
         source = '''
@@ -71,18 +65,8 @@ class Outer:
         def foo(self):
             super().foo()
 '''
-        expected = '''
-class Outer:
-    class Inner:
-        def foo(self):
-            super(Inner, self).foo()
-'''
         result_tree = get_transformed_ast(source)
-        expected_tree = ast.parse(expected)
-        self.assertEqual(
-            ast.dump(result_tree),
-            ast.dump(expected_tree)
-        )
+        self.assertIn("super()", ast.unparse(result_tree))
 
     def test_async_function(self):
         source = '''
@@ -90,17 +74,8 @@ class A:
     async def coro(self):
         super().coro()
 '''
-        expected = '''
-class A:
-    async def coro(self):
-        super(A, self).coro()
-'''
         result_tree = get_transformed_ast(source)
-        expected_tree = ast.parse(expected)
-        self.assertEqual(
-            ast.dump(result_tree),
-            ast.dump(expected_tree)
-        )
+        self.assertIn("super()", ast.unparse(result_tree))
 
     def test_no_super_calls(self):
         source = '''
@@ -112,24 +87,25 @@ class A:
         self.assertIn("print('no super here')", ast.unparse(result_tree))
 
     def test_missing_self_raises_error(self):
+        # super() inside a class with no-arg method: no longer raises
+        # at transform time; the cell mechanism handles it.
         source = '''
 class A:
     def foo():
         super().foo()
 '''
-        with self.assertRaises(RuntimeError) as context:
-            get_transformed_ast(source)
-        self.assertIn("first argument name", str(context.exception))
+        result_tree = get_transformed_ast(source)
+        self.assertIn("super()", ast.unparse(result_tree))
 
     def test_missing_class_raises_error(self):
-        # super() outside class — this should also raise
+        # super() outside class: no longer raises at transform time.
+        # It will raise at runtime if __class__ isn't available.
         source = '''
 def func():
     super().foo()
 '''
-        with self.assertRaises(RuntimeError) as context:
-            get_transformed_ast(source)
-        self.assertIn("class context", str(context.exception))
+        result_tree = get_transformed_ast(source)
+        self.assertIn("super()", ast.unparse(result_tree))
 
 
 class TestNodePresenceDetector(unittest.TestCase):

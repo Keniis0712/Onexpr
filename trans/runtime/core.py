@@ -126,6 +126,11 @@ def _del_local(name):
     return None
 
 
+# Sentinel for "cell has no contents yet" — used in _make_class to
+# distinguish an empty cell from one that holds None.
+_CELL_EMPTY = object()
+
+
 # Build a class the same way `class Foo(...)` does at the source
 # level. The user code's "lambda body returning a dict" path skips
 # the metaclass protocol entirely; this helper restores it:
@@ -187,7 +192,31 @@ def _make_class(metaclass, name, bases, body_dict, **kw):
     if used_mro_entries:
         ns['__orig_bases__'] = orig_bases
     ns.update(body_dict)
-    return metaclass(name, bases, ns, **kw)
+    cls = metaclass(name, bases, ns, **kw)
+
+    # PEP 3135 / zero-arg super() support: the class body lambda
+    # captures a `__class__` cell (initialised to None) so that
+    # nested method lambdas can closure-capture it. Now that the
+    # class object exists, fill every such cell with `cls`.
+    for val in body_dict.values():
+        func = val
+        if isinstance(val, classmethod):
+            func = val.__func__
+        elif isinstance(val, staticmethod):
+            func = val.__func__
+        if callable(func) and hasattr(func, '__closure__') and func.__closure__:
+            fvars = getattr(func.__code__, 'co_freevars', ())
+            if '__class__' in fvars:
+                idx = fvars.index('__class__')
+                cell = func.__closure__[idx]
+                # Only fill if the cell is currently empty (None) or
+                # already holds the right class. Avoid overwriting a
+                # cell that was legitimately set by a nested class.
+                current = getattr(cell, 'cell_contents', _CELL_EMPTY)
+                if current is _CELL_EMPTY or current is None:
+                    cell.cell_contents = cls
+
+    return cls
 
 
 # Coroutine plumbing: an `await x` expression in user code lowers to

@@ -4,6 +4,10 @@ import os
 from .passes import NodePresenceDetector
 
 
+# ---------------------------------------------------------------------------
+# Low-level loader
+# ---------------------------------------------------------------------------
+
 def _load_runtime_module(filename: str) -> list:
     """Read a sibling runtime/<filename>.py, parse it, and return its
     top-level statement list. The file is processed at transform time
@@ -15,26 +19,11 @@ def _load_runtime_module(filename: str) -> list:
     return ast.parse(src).body
 
 
-try_helper_name = '_TryHelper'
-
-
-def _get_try_helper_body() -> list:
-    # Always re-parse — see _get_core_helper_body for why caching the
-    # parsed copy doesn't work.
-    return _load_runtime_module('try_helper.py')
-
-
-def _get_typealias_body() -> list:
-    return _load_runtime_module('typealias.py')
-
-
-def _get_inspect_patch_body() -> list:
-    return _load_runtime_module('inspect_patch.py')
-
+# ---------------------------------------------------------------------------
+# Detectors
+# ---------------------------------------------------------------------------
 
 def _has_pep695(tree: ast.AST) -> bool:
-    """True iff the tree uses PEP 695 syntax: `type X = ...`,
-    `def f[T](...)`, or `class C[T]:`."""
     for node in ast.walk(tree):
         if isinstance(node, ast.TypeAlias):
             return True
@@ -45,12 +34,8 @@ def _has_pep695(tree: ast.AST) -> bool:
 
 
 def _has_async_generator(tree: ast.AST) -> bool:
-    """True iff the tree contains an AsyncFunctionDef whose body uses
-    yield / yield from directly. Such functions are async generators
-    (PEP 525) and need a different shape than plain async def."""
     class _V(ast.NodeVisitor):
-        def __init__(self):
-            self.found = False
+        def __init__(self): self.found = False
         def visit_Lambda(self, node): pass
         def visit_Yield(self, node): self.found = True
         def visit_YieldFrom(self, node): self.found = True
@@ -66,18 +51,13 @@ def _has_async_generator(tree: ast.AST) -> bool:
 
 
 def _has_generator_function(tree: ast.AST) -> bool:
-    """True iff the tree contains a FunctionDef whose body uses
-    yield / yield from directly (not in a nested function), or any
-    AsyncFunctionDef (which we lower to a generator state machine)."""
     class _V(ast.NodeVisitor):
-        def __init__(self):
-            self.found = False
-        def visit_Lambda(self, node):
-            pass
-        def visit_Yield(self, node):
-            self.found = True
-        def visit_YieldFrom(self, node):
-            self.found = True
+        def __init__(self): self.found = False
+        def visit_Lambda(self, node): pass
+        def visit_FunctionDef(self, node): pass
+        def visit_AsyncFunctionDef(self, node): pass
+        def visit_Yield(self, node): self.found = True
+        def visit_YieldFrom(self, node): self.found = True
 
     for node in ast.walk(tree):
         if isinstance(node, ast.AsyncFunctionDef):
@@ -91,46 +71,156 @@ def _has_generator_function(tree: ast.AST) -> bool:
     return False
 
 
-for_helper_name = '_ForHelper'
+def _has_bare_raise(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Raise) and node.exc is None:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Helper name constants (used by parsers / gen_compile)
+# ---------------------------------------------------------------------------
+
+for_helper_name   = '_ForHelper'
 while_helper_name = '_WhileHelper'
-func_helper_name = '_FuncHelper'
+func_helper_name  = '_FuncHelper'
+try_helper_name   = '_TryHelper'
 
-LIB_TYPES = '_types'
+LIB_TYPES       = '_types'
 LIB_COLLECTIONS = '_collections'
-LIB_INSPECT = '_inspect'
+LIB_INSPECT     = '_inspect'
 
 
-def _get_core_helper_body() -> list:
-    """Top-level statements of trans/runtime/core.py: the three helper
-    class definitions. Each ClassDef (and every method nested inside)
-    is annotated with `_use_legacy_return = True`, so parse_class_def /
-    parse_function_def take the older `(value, True)` tuple-and-[0]
-    return convention and avoid referring to _FuncHelper while
-    _FuncHelper is itself being defined."""
-    # Always re-parse — parse_class_def mutates the body (appends
-    # `return locals()`), so reusing a single parsed copy across
-    # transforms accumulates injected returns.
-    body = _load_runtime_module('core.py')
-    kept = []
-    for stmt in body:
-        if isinstance(stmt, ast.ClassDef) and stmt.name in (
-            func_helper_name, for_helper_name, while_helper_name,
-            '_AsyncGenWrapper', '_UserYield',
-        ):
-            if stmt.name in (func_helper_name, for_helper_name, while_helper_name):
-                _mark_legacy_return(stmt)
-            kept.append(stmt)
-        elif isinstance(stmt, ast.FunctionDef):
-            # Module-level helper functions (e.g. _del_local). These
-            # appear after the helper classes, so they CAN reference
-            # _FuncHelper through the regular transform path.
-            kept.append(stmt)
-        elif isinstance(stmt, ast.Assign):
-            # Module-level Assigns in core.py (e.g. the
-            # types.coroutine wrap on _async_gen_anext). Keep them so
-            # they get spliced in alongside their owning function.
-            kept.append(stmt)
-    return kept
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+# Each entry:
+#   file      – runtime/<file>.py to load
+#   names     – top-level names exported (used for dedup / ordering)
+#   condition – callable(tree, presence) -> bool; None means always
+#   deps      – list of entry keys that must come before this one
+#   legacy    – if True, mark every FunctionDef/ClassDef with _use_legacy_return
+#
+# Topological injection order is derived from deps.
+
+_REGISTRY = {
+    # ---- always-needed ----
+    'func_helper': {
+        'file': 'func_helper.py',
+        'names': ['_FuncHelper'],
+        'condition': None,
+        'deps': [],
+        'legacy': True,
+    },
+    'for_helper': {
+        'file': 'for_helper.py',
+        'names': ['_ForHelper'],
+        # Always inject: _make_class uses it, and it's tiny.
+        'condition': None,
+        'deps': ['func_helper'],
+        'legacy': True,
+    },
+    'while_helper': {
+        'file': 'while_helper.py',
+        'names': ['_WhileHelper'],
+        'condition': lambda tree, p: (
+            ast.While in p
+            or ast.With in p
+            or ast.AsyncWith in p
+            or _has_generator_function(tree)
+        ),
+        'deps': ['func_helper'],
+        'legacy': True,
+    },
+    'del_local': {
+        'file': 'del_local.py',
+        'names': ['_del_local'],
+        'condition': lambda tree, p: ast.Delete in p,
+        'deps': [],
+        'legacy': False,
+    },
+    'make_class': {
+        'file': 'make_class.py',
+        'names': ['_CELL_EMPTY', '_make_class'],
+        # Always inject: every ClassDef emits a _make_class call.
+        'condition': None,
+        'deps': ['func_helper', 'for_helper'],
+        'legacy': False,
+    },
+    'gen_sentinel': {
+        'file': 'gen_sentinel.py',
+        'names': ['_GEN_DONE_SENTINEL'],
+        'condition': lambda tree, p: _has_generator_function(tree),
+        'deps': [],
+        'legacy': False,
+    },
+    'try_helper': {
+        'file': 'try_helper.py',
+        'names': ['_TryHelper'],
+        'condition': lambda tree, p: (
+            ast.Try in p
+            or ast.TryStar in p
+            or ast.With in p
+            or ast.AsyncWith in p
+            or _has_generator_function(tree)
+            or _has_bare_raise(tree)
+        ),
+        'deps': ['func_helper', 'for_helper', 'while_helper'],
+        'legacy': False,
+    },
+    'await_iter': {
+        'file': 'await_iter.py',
+        'names': ['_await_iter'],
+        'condition': lambda tree, p: ast.AsyncFunctionDef in p,
+        'deps': [],
+        'legacy': False,
+    },
+    'async_gen': {
+        'file': 'async_gen.py',
+        'names': [
+            '_UserYield', '_AsyncGenWrapper',
+            '_async_gen_anext', '_async_gen_asend',
+            '_async_gen_athrow', '_async_gen_aclose',
+        ],
+        'condition': lambda tree, p: _has_async_generator(tree),
+        'deps': [],
+        'legacy': False,
+    },
+    'typealias': {
+        'file': 'typealias.py',
+        'names': ['_LazyAlias', '_TAProxy'],
+        'condition': lambda tree, p: _has_pep695(tree),
+        'deps': [],
+        'legacy': False,
+    },
+    'inspect_patch': {
+        'file': 'inspect_patch.py',
+        'names': ['_onexpr_patched_has_code_flag'],
+        'condition': lambda tree, p: _has_generator_function(tree),
+        'deps': [],
+        'legacy': False,
+    },
+}
+
+
+def _topo_sort(keys: list[str]) -> list[str]:
+    """Return keys in dependency order (deps before dependents).
+    Deps are pulled in transitively even if their own condition was False."""
+    result = []
+    visited = set()
+
+    def visit(k):
+        if k in visited:
+            return
+        visited.add(k)
+        for dep in _REGISTRY[k]['deps']:
+            visit(dep)   # always follow deps, regardless of keys_set
+        result.append(k)
+
+    for k in keys:
+        visit(k)
+    return result
 
 
 def _mark_legacy_return(node: ast.AST) -> None:
@@ -139,173 +229,64 @@ def _mark_legacy_return(node: ast.AST) -> None:
             n._use_legacy_return = True
 
 
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 def add_helper(tree: ast.AST, top_func_helper_var: str):
-    # Get all used node types
     detector = NodePresenceDetector()
     detector.visit(tree)
+    presence = detector.presence
 
-    # The try-helper runtime contains for-loops and while-loops, so
-    # injecting it pulls in _ForHelper / _WhileHelper as a transitive
-    # dependency. `with` also uses the try-helper (its with_block).
-    # _make_class also has a for-loop in its body (to walk bases),
-    # and we always inject _make_class.
-    needs_try_runtime = (
-        ast.Try in detector.presence
-        or ast.TryStar in detector.presence
-        or ast.With in detector.presence
-        or ast.AsyncWith in detector.presence
-        # Generator state machines wrap their dispatch in a
-        # try/except so user except clauses inside a generator body
-        # can dispatch on caught exceptions.
-        or _has_generator_function(tree)
-    )
-    # _make_class is always injected (it instantiates every emitted
-    # ClassDef, including the helpers themselves and the generator
-    # state-machine class). Its body uses a for-loop, so we need
-    # _ForHelper unconditionally.
-    needs_for = True
-    needs_while = (
-        ast.While in detector.presence
-        or needs_try_runtime
-        or _has_generator_function(tree)  # state machine uses while True
-    )
+    # Determine which helpers are needed.
+    needed = []
+    for key, entry in _REGISTRY.items():
+        cond = entry['condition']
+        if cond is None or cond(tree, presence):
+            needed.append(key)
 
-    # Pull in the three core helper classes; each is annotated for the
-    # legacy return convention so transforming them doesn't reference
-    # _FuncHelper before it's bound. Module-level helper functions
-    # (e.g. _del_local) are pulled in on demand based on what the user
-    # code uses.
-    core_body = _get_core_helper_body()
-    core_by_name = {}
-    core_extras = []
-    for s in core_body:
-        if hasattr(s, 'name'):
-            core_by_name[s.name] = s
-        else:
-            core_extras.append(s)
+    ordered = _topo_sort(needed)
 
-    to_insert = [core_by_name[func_helper_name]]
-    if needs_for:
-        to_insert.append(core_by_name[for_helper_name])
-    if needs_while:
-        to_insert.append(core_by_name[while_helper_name])
-    if ast.Delete in detector.presence and '_del_local' in core_by_name:
-        to_insert.append(core_by_name['_del_local'])
-    # _make_class is needed by every ClassDef parse_class_def emits,
-    # including the helper classes we always inject. Always include it.
-    if '_make_class' in core_by_name:
-        to_insert.append(core_by_name['_make_class'])
+    # Load and (optionally) mark each helper's stmts.
+    to_insert: list[ast.stmt] = []
+    for key in ordered:
+        entry = _REGISTRY[key]
+        stmts = _load_runtime_module(entry['file'])
+        if entry['legacy']:
+            for s in stmts:
+                _mark_legacy_return(s)
+        to_insert.extend(stmts)
 
-    # Generator state machines need a sentinel to distinguish "iterator
-    # exhausted" from "iterator yielded None" — built via next(it,
-    # sentinel). Define it module-level so every generator class can
-    # see it.
-    if _has_generator_function(tree):
-        to_insert.append(
-            ast.Assign(
-                targets=[ast.Name(id='_GEN_DONE_SENTINEL', ctx=ast.Store())],
-                value=ast.Call(
-                    func=ast.Name(id='object', ctx=ast.Load()),
-                    args=[], keywords=[],
+    # Coroutine registration: when AsyncFunctionDef is present, register
+    # GeneratorType as a Coroutine so our fake coroutines are awaitable.
+    if ast.AsyncFunctionDef in presence:
+        to_insert.append(ast.Import(names=[
+            ast.alias(name='types',          asname=LIB_TYPES),
+            ast.alias(name='collections.abc', asname=LIB_COLLECTIONS),
+            ast.alias(name='inspect',         asname=LIB_INSPECT),
+        ]))
+        to_insert.append(ast.Expr(value=ast.Call(
+            func=ast.Attribute(
+                value=ast.Attribute(
+                    value=ast.Name(id=LIB_COLLECTIONS, ctx=ast.Load()),
+                    attr='Coroutine', ctx=ast.Load(),
                 ),
-            )
-        )
-
-    if ast.AsyncFunctionDef in detector.presence:
-        to_insert.append(ast.Import(
-            names=[
-                ast.alias(
-                    name='types',
-                    asname=LIB_TYPES,
-                ),
-                ast.alias(
-                    name='collections.abc',
-                    asname=LIB_COLLECTIONS,
-                ),
-                ast.alias(
-                    name='inspect',
-                    asname=LIB_INSPECT,
-                )
-            ]
-        ))
-        if '_await_iter' in core_by_name:
-            to_insert.append(core_by_name['_await_iter'])
-        to_insert.append(
-            ast.Expr(
-                value=ast.Call(
-                    func=ast.Attribute(
-                        value=ast.Attribute(
-                            value=ast.Name(id=LIB_COLLECTIONS, ctx=ast.Load()),
-                            attr='Coroutine',
-                            ctx=ast.Load()
-                        ),
-                        attr='register',
-                        ctx=ast.Load()
-                    ),
-                    args=[
-                        ast.Attribute(
-                            value=ast.Name(id=LIB_TYPES, ctx=ast.Load()),
-                            attr='GeneratorType',
-                            ctx=ast.Load()
-                        )
-                    ],
-                    keywords=[],
-                )
-            )
-        )
-
-        # If the user has an `async def` with `yield` (an async
-        # generator), pull in _AsyncGenWrapper + the per-protocol
-        # forwarders, plus the types.coroutine wrap assigns.
-        if _has_async_generator(tree):
-            for n in (
-                '_UserYield',
-                '_AsyncGenWrapper',
-                '_async_gen_anext',
-                '_async_gen_asend',
-                '_async_gen_athrow',
-                '_async_gen_aclose',
-            ):
-                if n in core_by_name:
-                    to_insert.append(core_by_name[n])
-            # Assigns that wrap the four forwarders via types.coroutine
-            # live in core_extras (they're Assigns, not defs).
-            for s in core_extras:
-                # All extras are tied to async-gen plumbing right now,
-                # so include them here.
-                to_insert.append(s)
-
-    to_insert.append(
-        ast.Assign(
-            targets=[ast.Name(id=top_func_helper_var, ctx=ast.Store())],
-            value=ast.Call(
-                func=ast.Name(id=func_helper_name, ctx=ast.Load()),
-                args=[],
-                keywords=[],
+                attr='register', ctx=ast.Load(),
             ),
-        )
-    )
+            args=[ast.Attribute(
+                value=ast.Name(id=LIB_TYPES, ctx=ast.Load()),
+                attr='GeneratorType', ctx=ast.Load(),
+            )],
+            keywords=[],
+        )))
 
-    # Inject the try/except runtime helper if the user code uses `try`.
-    # Unlike the for/while/func helpers (whose class definitions are
-    # exec'd as a string blob to avoid chicken-and-egg with _FuncHelper),
-    # the try helper is a regular set of top-level statements that goes
-    # through the full onexpr transformation along with user code.
-    if needs_try_runtime:
-        to_insert = to_insert + _get_try_helper_body()
-
-    if _has_pep695(tree):
-        to_insert = to_insert + _get_typealias_body()
-
-    # The inspect monkey-patch helps any tree that contains
-    # generator/coroutine forwarders (sync gen, async gen, or
-    # coroutine) — the forwarders advertise their actual semantics
-    # via _onexpr_code_flags so inspect.isgeneratorfunction etc.
-    # don't misclassify a coroutine forwarder (which is internally a
-    # `yield from` lambda) as a sync generator. Inject whenever the
-    # tree has any generator function so the patch is in place
-    # before the forwarders set their flags.
-    if _has_generator_function(tree):
-        to_insert = to_insert + _get_inspect_patch_body()
+    # Module-level _FuncHelper instance (the top-level "function" helper).
+    to_insert.append(ast.Assign(
+        targets=[ast.Name(id=top_func_helper_var, ctx=ast.Store())],
+        value=ast.Call(
+            func=ast.Name(id=func_helper_name, ctx=ast.Load()),
+            args=[], keywords=[],
+        ),
+    ))
 
     tree.body = to_insert + tree.body

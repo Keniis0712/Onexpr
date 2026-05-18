@@ -37,15 +37,15 @@ class Store:
         self._items: dict[int, Item] = {}
         self._next_id = 1
 
-    def list_all(self, limit: int) -> list[Item]:
+    def list(self, limit: int) -> list[Item]:
         return list(self._items.values())[:limit]
 
-    def get_one(self, item_id: int) -> Item:
+    def get(self, item_id: int) -> Item:
         if item_id not in self._items:
             raise HTTPException(status_code=404, detail=f"item {item_id} not found")
         return self._items[item_id]
 
-    def add_one(self, item: Item) -> Item:
+    def add(self, item: Item) -> Item:
         item.id = self._next_id
         self._next_id += 1
         self._items[item.id] = item
@@ -54,8 +54,8 @@ class Store:
 
 # Singleton store instance, injected via Depends.
 _store = Store()
-_store.add_one(Item(name="seed-a", price=1.0, tags=["seed"]))
-_store.add_one(Item(name="seed-b", price=2.5))
+_store.add(Item(name="seed-a", price=1.0, tags=["seed"]))
+_store.add(Item(name="seed-b", price=2.5))
 
 
 def get_store() -> Store:
@@ -75,7 +75,7 @@ async def list_items(
     store: Annotated[Store, Depends(get_store)],
     limit: Annotated[int, Query(ge=1, le=100)] = 10,
 ) -> list[Item]:
-    return store.list_all(limit)
+    return store.list(limit)
 
 
 @app.get("/items/{item_id}")
@@ -83,7 +83,7 @@ async def get_item(
     item_id: int,
     store: Annotated[Store, Depends(get_store)],
 ) -> Item:
-    return store.get_one(item_id)
+    return store.get(item_id)
 
 
 @app.post("/items")
@@ -91,7 +91,7 @@ async def create_item(
     item: Item,
     store: Annotated[Store, Depends(get_store)],
 ) -> Item:
-    return store.add_one(item)
+    return store.add(item)
 
 
 @app.get("/stream")
