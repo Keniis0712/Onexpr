@@ -43,7 +43,7 @@ def compile_generator(stmt, frame, is_async=False, async_kind=None) -> list:
     boxed = collect_user_locals(body, stmt.args)
 
     # 3. Build the CFG.
-    blocks = build_cfg(body, name_provider)
+    blocks = build_cfg(body, name_provider, frame=frame)
 
     # 4. Rewrite Name references to self.<name> for boxed names.
     rewrite_block_to_self(blocks, boxed)

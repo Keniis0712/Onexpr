@@ -38,6 +38,17 @@ class Frame:
     # break the runtime. Only the top frame owns this; descendants
     # consult via prev.
     helper_names: Optional[dict] = None
+    # Map from a helper's member identifier (method or self-attribute,
+    # e.g. 'do_return', 'returned', 'pending_continue', 'state',
+    # '_exc_stack') to the name actually emitted. Identity map when
+    # mangling is off; populated with fresh temp_N strings when
+    # --replace-name global is used. Only the top frame owns it.
+    helper_members: Optional[dict] = None
+    # Prefix used when boxing a user-level name onto the function helper
+    # for nonlocal / try-clause assigns (the `_b_` prefix in the source
+    # `helper._b_x`). Becomes a fresh temp_N-style prefix under
+    # mangling. Only the top frame owns it.
+    helper_box_prefix: Optional[str] = None
 
     def get_temp_var_num(self) -> int:
         if self.temp_var_num is None:
@@ -58,6 +69,22 @@ class Frame:
         if self.helper_names is not None:
             return self.helper_names.get(original, original)
         return self.prev.get_helper_name(original)
+
+    def get_helper_member(self, original: str) -> str:
+        """Return the actual emitted name for a helper class member or
+        state-machine self-attribute (e.g. do_return, returned, _exc).
+        Identity map by default; populated when --replace-name global
+        is requested."""
+        if self.helper_members is not None:
+            return self.helper_members.get(original, original)
+        return self.prev.get_helper_member(original)
+
+    def get_box_prefix(self) -> str:
+        """Prefix used to name boxed-onto-helper variables. Defaults to
+        `_b_`; rewritten to a fresh temp_N-style prefix under mangling."""
+        if self.helper_box_prefix is not None:
+            return self.helper_box_prefix
+        return self.prev.get_box_prefix()
 
     def get_temp_var(self):
         reserved = self.get_reserved_names()

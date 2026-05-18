@@ -27,7 +27,7 @@ def parse_raise(stmt: ast.Raise, frame: Frame) -> list[_ast.AST]:
             #        else __import__('sys').exc_info()[1])
             stack_attr = ast.Attribute(
                 value=ast.Name(id=frame.get_helper_name(try_helper_name), ctx=ast.Load()),
-                attr='_exc_stack', ctx=ast.Load(),
+                attr=frame.get_helper_member('_exc_stack'), ctx=ast.Load(),
             )
             sys_excinfo = ast.Subscript(
                 value=ast.Call(
@@ -102,7 +102,7 @@ def parse_raise(stmt: ast.Raise, frame: Frame) -> list[_ast.AST]:
 
 
 def parse_try(stmt: ast.Try, frame: Frame) -> list[_ast.AST]:
-    return _parse_try_common(stmt, frame, dispatch_attr='dispatch')
+    return _parse_try_common(stmt, frame, dispatch_attr=frame.get_helper_member('dispatch'))
 
 
 def _parse_try_common(stmt, frame: Frame, dispatch_attr: str) -> list[_ast.AST]:
@@ -202,7 +202,7 @@ def _parse_try_common(stmt, frame: Frame, dispatch_attr: str) -> list[_ast.AST]:
                 value=ast.Call(
                     func=ast.Attribute(
                         value=ast.Name(id=frame.get_helper_name(try_helper_name), ctx=ast.Load()),
-                        attr='guarded',
+                        attr=frame.get_helper_member('guarded'),
                         ctx=ast.Load(),
                     ),
                     args=[finally_lambda],
@@ -305,7 +305,7 @@ def _parse_try_common(stmt, frame: Frame, dispatch_attr: str) -> list[_ast.AST]:
     not_returned = ast.UnaryOp(
         op=ast.Not(),
         operand=ast.Attribute(
-            value=helper_name, attr='returned', ctx=ast.Load(),
+            value=helper_name, attr=frame.get_helper_member('returned'), ctx=ast.Load(),
         ),
     )
     throw_test_terms = [
@@ -322,7 +322,7 @@ def _parse_try_common(stmt, frame: Frame, dispatch_attr: str) -> list[_ast.AST]:
             ast.UnaryOp(
                 op=ast.Not(),
                 operand=ast.Attribute(
-                    value=loop_var_ref, attr='stopped', ctx=ast.Load(),
+                    value=loop_var_ref, attr=frame.get_helper_member('stopped'), ctx=ast.Load(),
                 ),
             )
         )
@@ -350,7 +350,7 @@ def _parse_try_common(stmt, frame: Frame, dispatch_attr: str) -> list[_ast.AST]:
             ast.BoolOp(
                 op=ast.And(),
                 values=[
-                    ast.Attribute(value=loop_var_ref, attr='stopped', ctx=ast.Load()),
+                    ast.Attribute(value=loop_var_ref, attr=frame.get_helper_member('stopped'), ctx=ast.Load()),
                     ast.Constant(value=True),
                 ],
             )
@@ -359,7 +359,7 @@ def _parse_try_common(stmt, frame: Frame, dispatch_attr: str) -> list[_ast.AST]:
             ast.BoolOp(
                 op=ast.And(),
                 values=[
-                    ast.Attribute(value=loop_var_ref, attr='pending_continue', ctx=ast.Load()),
+                    ast.Attribute(value=loop_var_ref, attr=frame.get_helper_member('pending_continue'), ctx=ast.Load()),
                     ast.Constant(value=True),
                 ],
             )
@@ -368,7 +368,7 @@ def _parse_try_common(stmt, frame: Frame, dispatch_attr: str) -> list[_ast.AST]:
 
 
 def parse_try_star(stmt: ast.TryStar, frame: Frame) -> list[_ast.AST]:
-    return _parse_try_common(stmt, frame, dispatch_attr='dispatch_star')
+    return _parse_try_common(stmt, frame, dispatch_attr=frame.get_helper_member('dispatch_star'))
 
 
 def parse_assert(stmt: ast.Assert, frame: Frame) -> list[_ast.AST]:

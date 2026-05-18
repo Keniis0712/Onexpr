@@ -21,7 +21,7 @@ def parse_return(stmt: ast.Return, frame: Frame) -> list[_ast.AST]:
         ast.Call(
             func=ast.Attribute(
                 value=ast.Name(id=frame.func_helper_var, ctx=ast.Load()),
-                attr='do_return',
+                attr=frame.get_helper_member('do_return'),
                 ctx=ast.Load(),
             ),
             args=[value],
@@ -349,7 +349,7 @@ def parse_break(_: ast.Break, frame: Frame) -> list[_ast.AST]:
         ast.Call(
             func=ast.Attribute(
                 value=ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load()),
-                attr='stop',
+                attr=frame.get_helper_member('stop'),
                 ctx=ast.Load(),
             ),
             args=[],
@@ -370,7 +370,7 @@ def parse_continue(stmt: ast.Continue, frame: Frame) -> list[_ast.AST]:
         ast.Call(
             func=ast.Attribute(
                 value=ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load()),
-                attr='do_continue',
+                attr=frame.get_helper_member('do_continue'),
                 ctx=ast.Load(),
             ),
             args=[],

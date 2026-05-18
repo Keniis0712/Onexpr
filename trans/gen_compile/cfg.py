@@ -9,9 +9,10 @@ from .self_rewrite import _self_name
 # CFG builder
 
 class _CFGBuilder:
-    def __init__(self, name_provider):
+    def __init__(self, name_provider, frame=None):
         self.blocks: list[Block] = []
         self.name = name_provider
+        self.frame = frame
         # Stack of (continue_target, break_target) for nested loops.
         self.loop_stack: list[tuple[int, int]] = []
         # Stack of currently-active try regions. Each entry is a dict
@@ -229,7 +230,7 @@ class _CFGBuilder:
                     targets=[ast.Name(id=capture_name, ctx=ast.Store())],
                     value=ast.Attribute(
                         value=_self_name(ast.Load()),
-                        attr='_sent',
+                        attr=self.frame.get_helper_member('_sent'),
                         ctx=ast.Load(),
                     ),
                 )
@@ -438,7 +439,7 @@ class _CFGBuilder:
                 targets=[
                     ast.Attribute(
                         value=_self_name(ast.Load()),
-                        attr='state', ctx=ast.Store(),
+                        attr=self.frame.get_helper_member('state'), ctx=ast.Store(),
                     )
                 ],
                 value=ast.Constant(value=reraise_blk.id),
@@ -458,7 +459,7 @@ class _CFGBuilder:
                         ],
                         value=ast.Attribute(
                             value=_self_name(ast.Load()),
-                            attr='_exc', ctx=ast.Load(),
+                            attr=self.frame.get_helper_member('_exc'), ctx=ast.Load(),
                         ),
                     )
                 )
@@ -473,7 +474,7 @@ class _CFGBuilder:
                     args=[
                         ast.Attribute(
                             value=_self_name(ast.Load()),
-                            attr='_exc', ctx=ast.Load(),
+                            attr=self.frame.get_helper_member('_exc'), ctx=ast.Load(),
                         ),
                         h.type,
                     ],
@@ -487,7 +488,7 @@ class _CFGBuilder:
                             targets=[
                                 ast.Attribute(
                                     value=_self_name(ast.Load()),
-                                    attr='state', ctx=ast.Store(),
+                                    attr=self.frame.get_helper_member('state'), ctx=ast.Store(),
                                 )
                             ],
                             value=ast.Constant(value=h_entry.id),
@@ -561,7 +562,7 @@ class _CFGBuilder:
                     targets=[
                         ast.Attribute(
                             value=_self_name(ast.Load()),
-                            attr='state', ctx=ast.Store(),
+                            attr=self.frame.get_helper_member('state'), ctx=ast.Store(),
                         )
                     ],
                     value=ast.Constant(value=finally_entry.id),
@@ -607,7 +608,7 @@ class _CFGBuilder:
                     targets=[
                         ast.Attribute(
                             value=_self_name(ast.Load()),
-                            attr='state', ctx=ast.Store(),
+                            attr=self.frame.get_helper_member('state'), ctx=ast.Store(),
                         )
                     ],
                     value=ast.Constant(value=finally_entry.id),
@@ -625,7 +626,7 @@ class _CFGBuilder:
                         targets=[
                             ast.Attribute(
                                 value=_self_name(ast.Load()),
-                                attr='state', ctx=ast.Store(),
+                                attr=self.frame.get_helper_member('state'), ctx=ast.Store(),
                             )
                         ],
                         value=ast.Constant(value=finally_entry.id),
@@ -653,7 +654,7 @@ class _CFGBuilder:
                             ],
                             value=ast.Attribute(
                                 value=_self_name(ast.Load()),
-                                attr='_exc', ctx=ast.Load(),
+                                attr=self.frame.get_helper_member('_exc'), ctx=ast.Load(),
                             ),
                         )
                     )
@@ -670,7 +671,7 @@ class _CFGBuilder:
                         args=[
                             ast.Attribute(
                                 value=_self_name(ast.Load()),
-                                attr='_exc', ctx=ast.Load(),
+                                attr=self.frame.get_helper_member('_exc'), ctx=ast.Load(),
                             ),
                             h.type,
                         ],
@@ -684,7 +685,7 @@ class _CFGBuilder:
                                 targets=[
                                     ast.Attribute(
                                         value=_self_name(ast.Load()),
-                                        attr='state', ctx=ast.Store(),
+                                        attr=self.frame.get_helper_member('state'), ctx=ast.Store(),
                                     )
                                 ],
                                 value=ast.Constant(value=h_entry.id),
@@ -710,7 +711,7 @@ class _CFGBuilder:
                     targets=[
                         ast.Attribute(
                             value=_self_name(ast.Load()),
-                            attr='state', ctx=ast.Store(),
+                            attr=self.frame.get_helper_member('state'), ctx=ast.Store(),
                         )
                     ],
                     value=ast.Constant(value=join.id),
@@ -736,7 +737,7 @@ class _CFGBuilder:
                                 targets=[
                                     ast.Attribute(
                                         value=_self_name(ast.Load()),
-                                        attr='state', ctx=ast.Store(),
+                                        attr=self.frame.get_helper_member('state'), ctx=ast.Store(),
                                     )
                                 ],
                                 value=ast.Constant(value=brk_target),
@@ -765,7 +766,7 @@ class _CFGBuilder:
                                 targets=[
                                     ast.Attribute(
                                         value=_self_name(ast.Load()),
-                                        attr='state', ctx=ast.Store(),
+                                        attr=self.frame.get_helper_member('state'), ctx=ast.Store(),
                                     )
                                 ],
                                 value=ast.Constant(value=cont_target),
@@ -794,7 +795,7 @@ class _CFGBuilder:
                             ast.Assign(
                                 targets=[ast.Attribute(
                                     value=_self_name(ast.Load()),
-                                    attr='_stopping_via_return', ctx=ast.Store(),
+                                    attr=self.frame.get_helper_member('_stopping_via_return'), ctx=ast.Store(),
                                 )],
                                 value=ast.Constant(value=True),
                             ),
@@ -831,7 +832,7 @@ class _CFGBuilder:
                         ast.Raise(
                             exc=ast.Attribute(
                                 value=_self_name(ast.Load()),
-                                attr='_exc', ctx=ast.Load(),
+                                attr=self.frame.get_helper_member('_exc'), ctx=ast.Load(),
                             ),
                             cause=None,
                         ),
@@ -887,11 +888,11 @@ def _stmt_contains_break_continue_return(stmt) -> bool:
     return v.found
 
 
-def build_cfg(body: list, name_provider) -> list:
+def build_cfg(body: list, name_provider, frame=None) -> list:
     """Returns a list of Blocks. Block 0 is the entry. The function
     must have a final terminator on every path; we add an implicit
     TEnd at the tail if the user's body falls off the end."""
-    builder = _CFGBuilder(name_provider)
+    builder = _CFGBuilder(name_provider, frame=frame)
     entry = builder.new_block()
     end = builder.emit(body, entry)
     if not end.is_terminated:

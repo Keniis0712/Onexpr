@@ -54,7 +54,7 @@ def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
                     ),
                     ast.Attribute(
                         value=ast.Name(id=helper_var, ctx=ast.Load()),
-                        attr='value',
+                        attr=sub_frame.get_helper_member('value'),
                         ctx=ast.Load(),
                     ),
                 ],

@@ -692,7 +692,7 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
                     ),
                     ast.Attribute(
                         value=ast.Name(id=helper_var, ctx=ast.Load()),
-                        attr='value',
+                        attr=sub_frame.get_helper_member('value'),
                         ctx=ast.Load(),
                     ),
                 ],

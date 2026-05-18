@@ -72,7 +72,7 @@ def emit_state_machine(
         ast.Assign(
             targets=[ast.Attribute(
                 value=ast.Name(id=init_self, ctx=ast.Load()),
-                attr='state', ctx=ast.Store(),
+                attr=frame.get_helper_member('state'), ctx=ast.Store(),
             )],
             value=ast.Constant(value=0),
         )
@@ -81,7 +81,7 @@ def emit_state_machine(
         ast.Assign(
             targets=[ast.Attribute(
                 value=ast.Name(id=init_self, ctx=ast.Load()),
-                attr='_sent', ctx=ast.Store(),
+                attr=frame.get_helper_member('_sent'), ctx=ast.Store(),
             )],
             value=ast.Constant(value=None),
         )
@@ -107,7 +107,7 @@ def emit_state_machine(
         ast.Assign(
             targets=[ast.Attribute(
                 value=ast.Name(id=init_self, ctx=ast.Load()),
-                attr='_stopping_via_return', ctx=ast.Store(),
+                attr=frame.get_helper_member('_stopping_via_return'), ctx=ast.Store(),
             )],
             value=ast.Constant(value=False),
         )
@@ -181,7 +181,7 @@ def emit_state_machine(
             ast.Assign(
                 targets=[ast.Attribute(
                     value=_self_name(ast.Load()),
-                    attr='_sent', ctx=ast.Store(),
+                    attr=frame.get_helper_member('_sent'), ctx=ast.Store(),
                 )],
                 value=ast.Constant(value=None),
             ),
@@ -205,8 +205,8 @@ def emit_state_machine(
     # Each block becomes a branch; terminators write self.state and
     # either continue (loop again) or return (yield) or raise.
     send_def = _emit_send(blocks, gen_self_alias=gen_self_alias, frame=frame)
-    throw_def = _emit_throw(blocks)
-    close_def = _emit_close()
+    throw_def = _emit_throw(blocks, frame=frame)
+    close_def = _emit_close(frame=frame)
 
     cls = ast.ClassDef(
         name='_Gen_' + name,
@@ -490,7 +490,7 @@ def _args_as_call_kwargs(args: ast.arguments) -> list:
     return out
 
 
-def _emit_close() -> ast.FunctionDef:
+def _emit_close(frame=None) -> ast.FunctionDef:
     """`close()` is throw(GeneratorExit). Per PEP 342:
        - If body re-raises GeneratorExit / StopIteration: silently OK.
        - If body yields a value: raise RuntimeError.
@@ -571,7 +571,7 @@ def _emit_close() -> ast.FunctionDef:
                     targets=[
                         ast.Attribute(
                             value=_self_name(ast.Load()),
-                            attr='state', ctx=ast.Store(),
+                            attr=frame.get_helper_member('state'), ctx=ast.Store(),
                         )
                     ],
                     value=ast.Attribute(
@@ -635,7 +635,7 @@ def _emit_close() -> ast.FunctionDef:
     )
 
 
-def _emit_throw(blocks: list) -> ast.FunctionDef:
+def _emit_throw(blocks: list, frame=None) -> ast.FunctionDef:
     """`throw(exc)` injects an exception at the current state — same as
     if the user's body raised it from inside the active block. We
     instantiate exc if it was passed as a class, then drive the same
@@ -657,7 +657,7 @@ def _emit_throw(blocks: list) -> ast.FunctionDef:
         args=[
             ast.Attribute(
                 value=_self_name(ast.Load()),
-                attr='state', ctx=ast.Load(),
+                attr=frame.get_helper_member('state'), ctx=ast.Load(),
             )
         ],
         keywords=[],
@@ -879,7 +879,7 @@ def _emit_throw(blocks: list) -> ast.FunctionDef:
                                     targets=[
                                         ast.Attribute(
                                             value=_self_name(ast.Load()),
-                                            attr='state', ctx=ast.Store(),
+                                            attr=frame.get_helper_member('state'), ctx=ast.Store(),
                                         )
                                     ],
                                     value=ast.Attribute(
@@ -939,7 +939,7 @@ def _emit_throw(blocks: list) -> ast.FunctionDef:
             targets=[
                 ast.Attribute(
                     value=_self_name(ast.Load()),
-                    attr='_exc', ctx=ast.Store(),
+                    attr=frame.get_helper_member('_exc'), ctx=ast.Store(),
                 )
             ],
             value=ast.Name(id='exc', ctx=ast.Load()),
@@ -969,7 +969,7 @@ def _emit_throw(blocks: list) -> ast.FunctionDef:
             targets=[
                 ast.Attribute(
                     value=_self_name(ast.Load()),
-                    attr='state', ctx=ast.Store(),
+                    attr=frame.get_helper_member('state'), ctx=ast.Store(),
                 )
             ],
             value=ast.Name(id='_h', ctx=ast.Load()),
@@ -1020,7 +1020,7 @@ def _emit_send(blocks: list, gen_self_alias: str = None, frame=None) -> ast.Func
             test=ast.Compare(
                 left=ast.Attribute(
                     value=_self_name(ast.Load()),
-                    attr='state', ctx=ast.Load(),
+                    attr=frame.get_helper_member('state'), ctx=ast.Load(),
                 ),
                 ops=[ast.Eq()],
                 comparators=[ast.Constant(value=blk.id)],
@@ -1064,7 +1064,7 @@ def _emit_send(blocks: list, gen_self_alias: str = None, frame=None) -> ast.Func
         args=[
             ast.Attribute(
                 value=_self_name(ast.Load()),
-                attr='state', ctx=ast.Load(),
+                attr=frame.get_helper_member('state'), ctx=ast.Load(),
             )
         ],
         keywords=[],
@@ -1092,7 +1092,7 @@ def _emit_send(blocks: list, gen_self_alias: str = None, frame=None) -> ast.Func
                         op=ast.Not(),
                         operand=ast.Attribute(
                             value=_self_name(ast.Load()),
-                            attr='_stopping_via_return', ctx=ast.Load(),
+                            attr=frame.get_helper_member('_stopping_via_return'), ctx=ast.Load(),
                         ),
                     ),
                 ],
@@ -1118,7 +1118,7 @@ def _emit_send(blocks: list, gen_self_alias: str = None, frame=None) -> ast.Func
             targets=[
                 ast.Attribute(
                     value=_self_name(ast.Load()),
-                    attr='_exc', ctx=ast.Store(),
+                    attr=frame.get_helper_member('_exc'), ctx=ast.Store(),
                 )
             ],
             value=ast.Name(id='_e', ctx=ast.Load()),
@@ -1141,7 +1141,7 @@ def _emit_send(blocks: list, gen_self_alias: str = None, frame=None) -> ast.Func
                     targets=[
                         ast.Attribute(
                             value=_self_name(ast.Load()),
-                            attr='state', ctx=ast.Store(),
+                            attr=frame.get_helper_member('state'), ctx=ast.Store(),
                         )
                     ],
                     value=ast.Name(id='_h', ctx=ast.Load()),
@@ -1183,7 +1183,7 @@ def _emit_send(blocks: list, gen_self_alias: str = None, frame=None) -> ast.Func
                     op=ast.Not(),
                     operand=ast.Attribute(
                         value=_self_name(ast.Load()),
-                        attr='_stopping_via_return', ctx=ast.Load(),
+                        attr=frame.get_helper_member('_stopping_via_return'), ctx=ast.Load(),
                     ),
                 ),
                 body=[
@@ -1231,7 +1231,7 @@ def _emit_send(blocks: list, gen_self_alias: str = None, frame=None) -> ast.Func
         ast.Assign(
             targets=[ast.Attribute(
                 value=_self_name(ast.Load()),
-                attr='_sent', ctx=ast.Store(),
+                attr=frame.get_helper_member('_sent'), ctx=ast.Store(),
             )],
             value=ast.Name(id='sent', ctx=ast.Load()),
         ),
@@ -1268,7 +1268,7 @@ def _emit_terminator(t, blocks, frame=None) -> list:
             ast.Assign(
                 targets=[ast.Attribute(
                     value=_self_name(ast.Load()),
-                    attr='state', ctx=ast.Store(),
+                    attr=frame.get_helper_member('state'), ctx=ast.Store(),
                 )],
                 value=ast.Constant(value=t.target),
             ),
@@ -1279,7 +1279,7 @@ def _emit_terminator(t, blocks, frame=None) -> list:
             ast.Assign(
                 targets=[ast.Attribute(
                     value=_self_name(ast.Load()),
-                    attr='state', ctx=ast.Store(),
+                    attr=frame.get_helper_member('state'), ctx=ast.Store(),
                 )],
                 value=ast.IfExp(
                     test=t.test,
@@ -1294,7 +1294,7 @@ def _emit_terminator(t, blocks, frame=None) -> list:
             ast.Assign(
                 targets=[ast.Attribute(
                     value=_self_name(ast.Load()),
-                    attr='state', ctx=ast.Store(),
+                    attr=frame.get_helper_member('state'), ctx=ast.Store(),
                 )],
                 value=ast.Constant(value=t.next),
             ),
@@ -1312,7 +1312,7 @@ def _emit_terminator(t, blocks, frame=None) -> list:
         # post-yield-from state directly when it consumes inner.
         sent = ast.Attribute(
             value=_self_name(ast.Load()),
-            attr='_sent', ctx=ast.Load(),
+            attr=frame.get_helper_member('_sent'), ctx=ast.Load(),
         )
         return [
             # self._yfrom = self.<iter_var>  — mark active for throw()/close()
@@ -1377,7 +1377,7 @@ def _emit_terminator(t, blocks, frame=None) -> list:
                         targets=[
                             ast.Attribute(
                                 value=_self_name(ast.Load()),
-                                attr='_sent', ctx=ast.Store(),
+                                attr=frame.get_helper_member('_sent'), ctx=ast.Store(),
                             )
                         ],
                         value=ast.Constant(value=None),
@@ -1415,7 +1415,7 @@ def _emit_terminator(t, blocks, frame=None) -> list:
                             ast.Assign(
                                 targets=[ast.Attribute(
                                     value=_self_name(ast.Load()),
-                                    attr='state', ctx=ast.Store(),
+                                    attr=frame.get_helper_member('state'), ctx=ast.Store(),
                                 )],
                                 value=ast.Constant(value=t.next),
                             ),
@@ -1453,7 +1453,7 @@ def _emit_terminator(t, blocks, frame=None) -> list:
                     ast.Assign(
                         targets=[ast.Attribute(
                             value=_self_name(ast.Load()),
-                            attr='state', ctx=ast.Store(),
+                            attr=frame.get_helper_member('state'), ctx=ast.Store(),
                         )],
                         value=ast.Constant(value=t.after),
                     ),
@@ -1470,7 +1470,7 @@ def _emit_terminator(t, blocks, frame=None) -> list:
                     ast.Assign(
                         targets=[ast.Attribute(
                             value=_self_name(ast.Load()),
-                            attr='state', ctx=ast.Store(),
+                            attr=frame.get_helper_member('state'), ctx=ast.Store(),
                         )],
                         value=ast.Constant(value=t.body),
                     ),
@@ -1485,7 +1485,7 @@ def _emit_terminator(t, blocks, frame=None) -> list:
             ast.Assign(
                 targets=[ast.Attribute(
                     value=_self_name(ast.Load()),
-                    attr='_stopping_via_return', ctx=ast.Store(),
+                    attr=frame.get_helper_member('_stopping_via_return'), ctx=ast.Store(),
                 )],
                 value=ast.Constant(value=True),
             ),
@@ -1503,7 +1503,7 @@ def _emit_terminator(t, blocks, frame=None) -> list:
             ast.Assign(
                 targets=[ast.Attribute(
                     value=_self_name(ast.Load()),
-                    attr='_stopping_via_return', ctx=ast.Store(),
+                    attr=frame.get_helper_member('_stopping_via_return'), ctx=ast.Store(),
                 )],
                 value=ast.Constant(value=True),
             ),
@@ -1523,7 +1523,7 @@ def _emit_terminator(t, blocks, frame=None) -> list:
             ast.Raise(
                 exc=ast.Attribute(
                     value=_self_name(ast.Load()),
-                    attr='_exc', ctx=ast.Load(),
+                    attr=frame.get_helper_member('_exc'), ctx=ast.Load(),
                 ),
                 cause=None,
             ),

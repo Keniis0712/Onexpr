@@ -8,7 +8,7 @@ from .parsers import parse_stmts
 from .passes import SuperTransformer, collect_user_names
 
 
-def parse_root(tree: ast.Module) -> ast.Module:
+def parse_root(tree: ast.Module, replace_name: str = 'none') -> ast.Module:
     # The transform recurses through the AST several times — for big
     # source files (e.g. CPython's own test_grammar.py with very
     # nested data literals) the default recursion limit can be too
@@ -18,10 +18,10 @@ def parse_root(tree: ast.Module) -> ast.Module:
     # Leave the limit raised — restoring it here would break unparse.
     if sys.getrecursionlimit() < 5000:
         sys.setrecursionlimit(5000)
-    return _parse_root_inner(tree)
+    return _parse_root_inner(tree, replace_name=replace_name)
 
 
-def _parse_root_inner(tree: ast.Module) -> ast.Module:
+def _parse_root_inner(tree: ast.Module, replace_name: str = 'none') -> ast.Module:
     # Init the top frame
     top_frame = Frame(None, [], [])
     top_frame.temp_var_num = 0
@@ -47,7 +47,7 @@ def _parse_root_inner(tree: ast.Module) -> ast.Module:
         top_frame=top_frame,
     )
 
-    add_helper(tree, top_frame)
+    add_helper(tree, top_frame, replace_name=replace_name)
 
     expr = parse_stmts(tree.body, top_frame)
     return ast.Module(

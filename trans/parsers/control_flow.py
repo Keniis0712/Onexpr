@@ -23,7 +23,7 @@ def make_loop_var_escape(target, frame) -> ast.expr:
     truthy value.
     """
     helper = ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load())
-    last_yielded = ast.Attribute(value=helper, attr='last_yielded', ctx=ast.Load())
+    last_yielded = ast.Attribute(value=helper, attr=frame.get_helper_member('last_yielded'), ctx=ast.Load())
 
     if isinstance(target, ast.Name):
         bind = ast.NamedExpr(
@@ -38,7 +38,7 @@ def make_loop_var_escape(target, frame) -> ast.expr:
         return ast.BoolOp(
             op=ast.And(),
             values=[
-                ast.Attribute(value=helper, attr='was_iterated', ctx=ast.Load()),
+                ast.Attribute(value=helper, attr=frame.get_helper_member('was_iterated'), ctx=ast.Load()),
                 ast.Subscript(
                     value=ast.Tuple(
                         elts=[bind, ast.Constant(value=False)],
@@ -148,7 +148,7 @@ def make_loop_var_escape(target, frame) -> ast.expr:
         return ast.BoolOp(
             op=ast.And(),
             values=[
-                ast.Attribute(value=helper, attr='was_iterated', ctx=ast.Load()),
+                ast.Attribute(value=helper, attr=frame.get_helper_member('was_iterated'), ctx=ast.Load()),
                 bind_tuple,
             ],
         )
@@ -165,7 +165,7 @@ def make_return_propagator(frame: Frame) -> ast.expr:
     return ast.BoolOp(
         op=ast.And(),
         values=[
-            ast.Attribute(value=helper, attr='returned', ctx=ast.Load()),
+            ast.Attribute(value=helper, attr=frame.get_helper_member('returned'), ctx=ast.Load()),
             ast.Constant(value=True),
         ],
     )
@@ -180,7 +180,7 @@ def add_orelse(orelse, frame):
                     op=ast.Not(),
                     operand=ast.Attribute(
                         value=ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load()),
-                        attr='stopped',
+                        attr=frame.get_helper_member('stopped'),
                         ctx=ast.Load(),
                     )
                 ),
@@ -188,7 +188,7 @@ def add_orelse(orelse, frame):
                     op=ast.Not(),
                     operand=ast.Attribute(
                         value=ast.Name(id=frame.func_helper_var, ctx=ast.Load()),
-                        attr='returned',
+                        attr=frame.get_helper_member('returned'),
                         ctx=ast.Load(),
                     )
                 ),
@@ -247,7 +247,7 @@ def parse_while(stmt: ast.While, frame: Frame) -> list[_ast.AST]:
         ast.Call(
             func=ast.Attribute(
                 value=ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load()),
-                attr='cond',
+                attr=frame.get_helper_member('cond'),
                 ctx=ast.Load(),
             ),
             args=[stmt.test],
@@ -374,7 +374,7 @@ def parse_with(stmt: ast.With, frame: Frame) -> list[_ast.AST]:
             value=ast.Call(
                 func=ast.Attribute(
                     value=ast.Name(id=frame.get_helper_name(try_helper_name), ctx=ast.Load()),
-                    attr='with_block',
+                    attr=frame.get_helper_member('with_block'),
                     ctx=ast.Load(),
                 ),
                 args=[
@@ -411,7 +411,7 @@ def parse_with(stmt: ast.With, frame: Frame) -> list[_ast.AST]:
     )
     not_returned = ast.UnaryOp(
         op=ast.Not(),
-        operand=ast.Attribute(value=helper_name_node, attr='returned', ctx=ast.Load()),
+        operand=ast.Attribute(value=helper_name_node, attr=frame.get_helper_member('returned'), ctx=ast.Load()),
     )
     throw_test_terms = [
         ast.Compare(
@@ -425,7 +425,7 @@ def parse_with(stmt: ast.With, frame: Frame) -> list[_ast.AST]:
         throw_test_terms.append(
             ast.UnaryOp(
                 op=ast.Not(),
-                operand=ast.Attribute(value=loop_name_node, attr='stopped', ctx=ast.Load()),
+                operand=ast.Attribute(value=loop_name_node, attr=frame.get_helper_member('stopped'), ctx=ast.Load()),
             )
         )
     stmts.append(
@@ -444,7 +444,7 @@ def parse_with(stmt: ast.With, frame: Frame) -> list[_ast.AST]:
             ast.BoolOp(
                 op=ast.And(),
                 values=[
-                    ast.Attribute(value=loop_ref, attr='stopped', ctx=ast.Load()),
+                    ast.Attribute(value=loop_ref, attr=frame.get_helper_member('stopped'), ctx=ast.Load()),
                     ast.Constant(value=True),
                 ],
             )
@@ -453,7 +453,7 @@ def parse_with(stmt: ast.With, frame: Frame) -> list[_ast.AST]:
             ast.BoolOp(
                 op=ast.And(),
                 values=[
-                    ast.Attribute(value=loop_ref, attr='pending_continue', ctx=ast.Load()),
+                    ast.Attribute(value=loop_ref, attr=frame.get_helper_member('pending_continue'), ctx=ast.Load()),
                     ast.Constant(value=True),
                 ],
             )
