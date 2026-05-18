@@ -41,7 +41,7 @@ def gen_func(stmt: ast.FunctionDef | ast.AsyncFunctionDef, sub_frame):
                                     ast.NamedExpr(
                                         target=ast.Name(id=helper_var, ctx=ast.Store()),
                                         value=ast.Call(
-                                            func=ast.Name(id=func_helper_name, ctx=ast.Load()),
+                                            func=ast.Name(id=sub_frame.get_helper_name(func_helper_name), ctx=ast.Load()),
                                             args=[],
                                             keywords=[],
                                         ),
@@ -191,14 +191,14 @@ def parse_async_function_def(stmt: ast.AsyncFunctionDef, frame: Frame) -> list[_
         # come out of `await` (which we lower to `yield from
         # _await_iter(x)` further down). Done before await rewriting
         # so we can tell them apart.
-        _wrap_user_yields(stmt.body)
+        _wrap_user_yields(stmt.body, frame)
     # Lower async comprehensions sitting at the top of a stmt
     # (Return / Assign / Expr) into explicit async-for loops over
     # an accumulator. Doesn't handle async comp nested inside larger
     # expressions — those stay an unimplemented edge case.
     stmt.body = _lower_async_comps(stmt.body)
     stmt.body = _lower_async_constructs(stmt.body)
-    _rewrite_await_in_body(stmt.body)
+    _rewrite_await_in_body(stmt.body, frame)
     if not _body_has_yield_or_yield_from(stmt.body):
         stmt.body.insert(
             0,
@@ -687,18 +687,19 @@ def _lower_async_comps(body):
     return out
 
 
-def _wrap_user_yields(body):
+def _wrap_user_yields(body, frame):
     """Wrap every `yield V` and `yield from X` in the generator body
     with _UserYield(...) so the async-generator anext coroutine can
     distinguish them from yields produced by `await` lowering. Doesn't
     descend into nested def / class / lambda."""
+    user_yield_name = frame.get_helper_name('_UserYield')
     class _R(ast.NodeTransformer):
         def visit_Yield(self, node):
             self.generic_visit(node)
             v = node.value if node.value is not None else ast.Constant(value=None)
             return ast.Yield(
                 value=ast.Call(
-                    func=ast.Name(id='_UserYield', ctx=ast.Load()),
+                    func=ast.Name(id=user_yield_name, ctx=ast.Load()),
                     args=[v],
                     keywords=[],
                 )
@@ -727,7 +728,7 @@ def _wrap_user_yields(body):
             return ast.YieldFrom(
                 value=ast.GeneratorExp(
                     elt=ast.Call(
-                        func=ast.Name(id='_UserYield', ctx=ast.Load()),
+                        func=ast.Name(id=user_yield_name, ctx=ast.Load()),
                         args=[ast.Name(id='_v', ctx=ast.Load())],
                         keywords=[],
                     ),
@@ -752,16 +753,17 @@ def _wrap_user_yields(body):
         body[i] = r.visit(s)
 
 
-def _rewrite_await_in_body(body):
+def _rewrite_await_in_body(body, frame):
     """Walk the function body, replacing `await x` with
     `yield from _await_iter(x)` (the latter wrapped in YieldFrom so
     the existing generator pipeline sees a yield)."""
+    await_iter_name = frame.get_helper_name('_await_iter')
     class _R(ast.NodeTransformer):
         def visit_Await(self, node):
             self.generic_visit(node)
             return ast.YieldFrom(
                 value=ast.Call(
-                    func=ast.Name(id='_await_iter', ctx=ast.Load()),
+                    func=ast.Name(id=await_iter_name, ctx=ast.Load()),
                     args=[node.value],
                     keywords=[],
                 )

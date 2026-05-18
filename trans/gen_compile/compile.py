@@ -58,4 +58,5 @@ def compile_generator(stmt, frame, is_async=False, async_kind=None) -> list:
         async_kind=async_kind,
         gen_self_alias=getattr(stmt, '_gen_self_alias', None),
         returns=stmt.returns,
+        frame=frame,
     )

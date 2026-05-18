@@ -47,7 +47,7 @@ def _parse_root_inner(tree: ast.Module) -> ast.Module:
         top_frame=top_frame,
     )
 
-    add_helper(tree, top_frame.func_helper_var)
+    add_helper(tree, top_frame)
 
     expr = parse_stmts(tree.body, top_frame)
     return ast.Module(

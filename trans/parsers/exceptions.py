@@ -26,7 +26,7 @@ def parse_raise(stmt: ast.Raise, frame: Frame) -> list[_ast.AST]:
             #        if _TryHelper._exc_stack
             #        else __import__('sys').exc_info()[1])
             stack_attr = ast.Attribute(
-                value=ast.Name(id='_TryHelper', ctx=ast.Load()),
+                value=ast.Name(id=frame.get_helper_name(try_helper_name), ctx=ast.Load()),
                 attr='_exc_stack', ctx=ast.Load(),
             )
             sys_excinfo = ast.Subscript(
@@ -185,7 +185,7 @@ def _parse_try_common(stmt, frame: Frame, dispatch_attr: str) -> list[_ast.AST]:
             targets=[ast.Name(id=e_pending, ctx=ast.Store())],
             value=ast.Call(
                 func=ast.Attribute(
-                    value=ast.Name(id=try_helper_name, ctx=ast.Load()),
+                    value=ast.Name(id=frame.get_helper_name(try_helper_name), ctx=ast.Load()),
                     attr=dispatch_attr,
                     ctx=ast.Load(),
                 ),
@@ -201,7 +201,7 @@ def _parse_try_common(stmt, frame: Frame, dispatch_attr: str) -> list[_ast.AST]:
                 targets=[ast.Name(id=e_finally_var, ctx=ast.Store())],
                 value=ast.Call(
                     func=ast.Attribute(
-                        value=ast.Name(id=try_helper_name, ctx=ast.Load()),
+                        value=ast.Name(id=frame.get_helper_name(try_helper_name), ctx=ast.Load()),
                         attr='guarded',
                         ctx=ast.Load(),
                     ),

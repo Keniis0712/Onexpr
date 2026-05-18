@@ -196,7 +196,7 @@ class _TryHelper:
         if e1 is None:
             terminated = func_helper.returned
             if not terminated and loop_helper is not None:
-                terminated = loop_helper.stopped
+                terminated = loop_helper.stopped or loop_helper.pending_continue
             if not terminated and else_fn is not None:
                 e_else = _TryHelper.guarded(else_fn)
                 # `else` ran with no in-flight exception, no context to chain.
@@ -241,7 +241,7 @@ class _TryHelper:
         if e1 is None:
             terminated = func_helper.returned
             if not terminated and loop_helper is not None:
-                terminated = loop_helper.stopped
+                terminated = loop_helper.stopped or loop_helper.pending_continue
             if not terminated and else_fn is not None:
                 return _TryHelper.guarded(else_fn)
             return None

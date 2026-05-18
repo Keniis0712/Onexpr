@@ -30,6 +30,14 @@ class Frame:
     # helper_var._b_<name> instead of a per-clause-lambda local that
     # would never be visible elsewhere.
     boxed_names: Optional[set] = None
+    # Map from a helper's source-file name (e.g. '_FuncHelper') to the
+    # name actually used in the emitted output. Equal to {} (or a
+    # subset of identity mappings) when the user's code doesn't shadow
+    # any helper. When the user assigns `_FuncHelper = ...` we instead
+    # rename the helper to a fresh temp_N so the user's binding can't
+    # break the runtime. Only the top frame owns this; descendants
+    # consult via prev.
+    helper_names: Optional[dict] = None
 
     def get_temp_var_num(self) -> int:
         if self.temp_var_num is None:
@@ -41,6 +49,15 @@ class Frame:
         if self.reserved_names is not None:
             return self.reserved_names
         return self.prev.get_reserved_names()
+
+    def get_helper_name(self, original: str) -> str:
+        """Return the actual emitted name for a helper (e.g. _FuncHelper).
+        When the user's code defines a name colliding with a helper's
+        source-file identifier, the top-level rename pass remaps it to
+        a fresh temp_N so user assignments can't break the runtime."""
+        if self.helper_names is not None:
+            return self.helper_names.get(original, original)
+        return self.prev.get_helper_name(original)
 
     def get_temp_var(self):
         reserved = self.get_reserved_names()

@@ -21,6 +21,7 @@ def emit_state_machine(
     async_kind: str = None,
     gen_self_alias: str = None,
     returns: ast.expr = None,
+    frame=None,
 ) -> list:
     """Build a sequence of statements that defines the generator class
     and binds it to `name`. Returned statements are intended to be
@@ -203,7 +204,7 @@ def emit_state_machine(
     # send: the actual state machine. while True: dispatch by self.state.
     # Each block becomes a branch; terminators write self.state and
     # either continue (loop again) or return (yield) or raise.
-    send_def = _emit_send(blocks, gen_self_alias=gen_self_alias)
+    send_def = _emit_send(blocks, gen_self_alias=gen_self_alias, frame=frame)
     throw_def = _emit_throw(blocks)
     close_def = _emit_close()
 
@@ -255,10 +256,11 @@ def emit_state_machine(
     elif async_kind == 'gen':
         # Wrap _Gen_name(*a, **kw) in _AsyncGenWrapper so the user's
         # call to name(*a, **kw) returns an async iterable.
+        async_gen_wrapper_name = frame.get_helper_name('_AsyncGenWrapper') if frame is not None else '_AsyncGenWrapper'
         forwarder = ast.Lambda(
             args=forwarder_args,
             body=ast.Call(
-                func=ast.Name(id='_AsyncGenWrapper', ctx=ast.Load()),
+                func=ast.Name(id=async_gen_wrapper_name, ctx=ast.Load()),
                 args=[forwarder_call],
                 keywords=[],
             ),
@@ -398,19 +400,20 @@ def emit_state_machine(
     # FastAPI's signature parsing, dataclasses, pydantic) sees them.
     # Crucial: the assignment must run BEFORE decorators apply, because
     # frameworks like FastAPI inspect annotations at decoration time.
+    from ..parsers.utils import _normalize_annotation
     ann_keys = []
     ann_values = []
     for group in (args.posonlyargs, args.args, args.kwonlyargs):
         for a in group:
             if a.annotation is not None:
                 ann_keys.append(ast.Constant(value=a.arg))
-                ann_values.append(a.annotation)
+                ann_values.append(_normalize_annotation(a.annotation))
     if args.vararg is not None and args.vararg.annotation is not None:
         ann_keys.append(ast.Constant(value=args.vararg.arg))
-        ann_values.append(args.vararg.annotation)
+        ann_values.append(_normalize_annotation(args.vararg.annotation))
     if args.kwarg is not None and args.kwarg.annotation is not None:
         ann_keys.append(ast.Constant(value=args.kwarg.arg))
-        ann_values.append(args.kwarg.annotation)
+        ann_values.append(_normalize_annotation(args.kwarg.annotation))
     if returns is not None:
         ann_keys.append(ast.Constant(value='return'))
         ann_values.append(returns)
@@ -1004,7 +1007,7 @@ def _emit_throw(blocks: list) -> ast.FunctionDef:
     )
 
 
-def _emit_send(blocks: list, gen_self_alias: str = None) -> ast.FunctionDef:
+def _emit_send(blocks: list, gen_self_alias: str = None, frame=None) -> ast.FunctionDef:
     """The state-machine dispatch. Big while True: if/elif chain by
     self.state, wrapped in a try/except that consults a per-state
     handler map for routing exceptions to user except clauses."""
@@ -1012,7 +1015,7 @@ def _emit_send(blocks: list, gen_self_alias: str = None) -> ast.FunctionDef:
     chain_body: list = []
     cur_orelse: list = []
     for blk in reversed(blocks):
-        block_body = list(blk.stmts) + _emit_terminator(blk.terminator, blocks)
+        block_body = list(blk.stmts) + _emit_terminator(blk.terminator, blocks, frame)
         cur = ast.If(
             test=ast.Compare(
                 left=ast.Attribute(
@@ -1256,9 +1259,10 @@ def _emit_send(blocks: list, gen_self_alias: str = None) -> ast.FunctionDef:
     )
 
 
-def _emit_terminator(t, blocks) -> list:
+def _emit_terminator(t, blocks, frame=None) -> list:
     """Emit the statements that close out a block based on its
     terminator. These get spliced into the if/elif body."""
+    gen_done_name = frame.get_helper_name(_GEN_DONE) if frame is not None else _GEN_DONE
     if isinstance(t, TGoto):
         return [
             ast.Assign(
@@ -1434,7 +1438,7 @@ def _emit_terminator(t, blocks) -> list:
                             value=_self_name(ast.Load()),
                             attr=t.iter_var, ctx=ast.Load(),
                         ),
-                        ast.Name(id=_GEN_DONE, ctx=ast.Load()),
+                        ast.Name(id=gen_done_name, ctx=ast.Load()),
                     ],
                     keywords=[],
                 ),
@@ -1443,7 +1447,7 @@ def _emit_terminator(t, blocks) -> list:
                 test=ast.Compare(
                     left=ast.Name(id='_v', ctx=ast.Load()),
                     ops=[ast.Is()],
-                    comparators=[ast.Name(id=_GEN_DONE, ctx=ast.Load())],
+                    comparators=[ast.Name(id=gen_done_name, ctx=ast.Load())],
                 ),
                 body=[
                     ast.Assign(

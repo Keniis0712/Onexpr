@@ -83,7 +83,7 @@ def parse_delete(stmt: ast.Delete, frame: Frame) -> list[_ast.AST]:
             # no Python-level way to unbind it.
             out.append(ast.Expr(
                 value=ast.Call(
-                    func=ast.Name(id='_del_local', ctx=ast.Load()),
+                    func=ast.Name(id=frame.get_helper_name('_del_local'), ctx=ast.Load()),
                     args=[ast.Constant(value=target.id)],
                     keywords=[],
                 )

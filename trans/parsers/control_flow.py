@@ -205,7 +205,7 @@ def parse_for(stmt: ast.For, frame: Frame) -> list[_ast.AST]:
         ast.Assign(
             targets=[ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Store())],
             value=ast.Call(
-                func=ast.Name(id=for_helper_name, ctx=ast.Load()),
+                func=ast.Name(id=frame.get_helper_name(for_helper_name), ctx=ast.Load()),
                 args=[
                     stmt.iter,
                     ast.Name(id=frame.func_helper_var, ctx=ast.Load()),
@@ -260,7 +260,7 @@ def parse_while(stmt: ast.While, frame: Frame) -> list[_ast.AST]:
         ast.Assign(
             targets=[ast.Name(id=frame.get_cur_loop_var(), ctx=ast.Load())],
             value=ast.Call(
-                func=ast.Name(id=while_helper_name, ctx=ast.Load()),
+                func=ast.Name(id=frame.get_helper_name(while_helper_name), ctx=ast.Load()),
                 args=[ast.Name(id=frame.func_helper_var, ctx=ast.Load())],
                 keywords=[],
             )
@@ -373,7 +373,7 @@ def parse_with(stmt: ast.With, frame: Frame) -> list[_ast.AST]:
             targets=[ast.Name(id=e_pending, ctx=ast.Store())],
             value=ast.Call(
                 func=ast.Attribute(
-                    value=ast.Name(id=try_helper_name, ctx=ast.Load()),
+                    value=ast.Name(id=frame.get_helper_name(try_helper_name), ctx=ast.Load()),
                     attr='with_block',
                     ctx=ast.Load(),
                 ),

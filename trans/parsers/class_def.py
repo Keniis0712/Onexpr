@@ -679,7 +679,7 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
                                     ast.NamedExpr(
                                         target=ast.Name(id=helper_var, ctx=ast.Store()),
                                         value=ast.Call(
-                                            func=ast.Name(id=func_helper_name, ctx=ast.Load()),
+                                            func=ast.Name(id=sub_frame.get_helper_name(func_helper_name), ctx=ast.Load()),
                                             args=[],
                                             keywords=[],
                                         ),
@@ -786,7 +786,7 @@ def parse_class_def(stmt: ast.ClassDef, frame: Frame) -> list[_ast.AST]:
         keywords=[],
     )
     construct = ast.Call(
-        func=ast.Name(id='_make_class', ctx=ast.Load()),
+        func=ast.Name(id=frame.get_helper_name('_make_class'), ctx=ast.Load()),
         args=[
             metaclass,
             ast.Constant(stmt.name),

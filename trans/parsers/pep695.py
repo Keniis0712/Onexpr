@@ -256,7 +256,7 @@ def parse_type_alias(stmt: ast.TypeAlias, frame: Frame) -> list[_ast.AST]:
         ctx=ast.Load(),
     )
     alias_construct = ast.Call(
-        func=ast.Name(id='_LazyAlias', ctx=ast.Load()),
+        func=ast.Name(id=frame.get_helper_name('_LazyAlias'), ctx=ast.Load()),
         args=[
             ast.Constant(value=stmt.name.id),
             thunk,

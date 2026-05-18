@@ -233,7 +233,15 @@ def _mark_legacy_return(node: ast.AST) -> None:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def add_helper(tree: ast.AST, top_func_helper_var: str):
+def add_helper(tree: ast.AST, top_frame):
+    """Insert the runtime helper classes/functions at the top of `tree`.
+
+    `top_frame` carries the reserved-name set and receives the
+    `helper_names` map this function builds. Any helper name that
+    collides with a name the user uses is rewritten to a fresh temp_N
+    in the loaded AST, and parsers consult `frame.get_helper_name(...)`
+    to discover the renamed identifier later.
+    """
     detector = NodePresenceDetector()
     detector.visit(tree)
     presence = detector.presence
@@ -247,11 +255,32 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
 
     ordered = _topo_sort(needed)
 
-    # Load and (optionally) mark each helper's stmts.
+    # Build the rename map. Any helper-exported name colliding with a
+    # name the user already uses (collected by collect_user_names) gets
+    # remapped to a fresh temp_N. Even helpers whose names don't
+    # collide get an identity entry, so frame.get_helper_name() returns
+    # the correct emitted name uniformly.
+    reserved = top_frame.reserved_names
+    rename_map: dict[str, str] = {}
+    for key in ordered:
+        for orig in _REGISTRY[key]['names']:
+            if orig in rename_map:
+                continue
+            if orig in reserved:
+                rename_map[orig] = top_frame.get_temp_var()
+            else:
+                rename_map[orig] = orig
+    top_frame.helper_names = rename_map
+
+    # Load and (optionally) mark each helper's stmts. Apply the rename
+    # so the helper class/function defs and their internal references
+    # all use the chosen identifier.
     to_insert: list[ast.stmt] = []
     for key in ordered:
         entry = _REGISTRY[key]
         stmts = _load_runtime_module(entry['file'])
+        for s in stmts:
+            _rename_helper_refs(s, rename_map)
         if entry['legacy']:
             for s in stmts:
                 _mark_legacy_return(s)
@@ -282,11 +311,36 @@ def add_helper(tree: ast.AST, top_func_helper_var: str):
 
     # Module-level _FuncHelper instance (the top-level "function" helper).
     to_insert.append(ast.Assign(
-        targets=[ast.Name(id=top_func_helper_var, ctx=ast.Store())],
+        targets=[ast.Name(id=top_frame.func_helper_var, ctx=ast.Store())],
         value=ast.Call(
-            func=ast.Name(id=func_helper_name, ctx=ast.Load()),
+            func=ast.Name(id=rename_map[func_helper_name], ctx=ast.Load()),
             args=[], keywords=[],
         ),
     ))
 
     tree.body = to_insert + tree.body
+
+
+def _rename_helper_refs(node: ast.AST, rename_map: dict[str, str]) -> None:
+    """Walk `node` and rename any identifier that maps in `rename_map`.
+
+    Targets:
+      - ast.Name (load and store) — the helper's own definition site
+        (`class _FuncHelper:` shows up as ClassDef, not Name) AND every
+        intra-helper reference (`_TryHelper.guarded(...)`,
+        `_async_gen_anext(self._g)`, etc.)
+      - ast.ClassDef.name / ast.FunctionDef.name — the definitions
+      - ast.AsyncFunctionDef.name — generator-protocol coroutine forwarders
+
+    Doesn't touch attribute names (`obj.foo`) or string constants —
+    those are intentional public surface, never helper identifiers.
+    """
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name):
+            new = rename_map.get(n.id)
+            if new is not None and new != n.id:
+                n.id = new
+        elif isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            new = rename_map.get(n.name)
+            if new is not None and new != n.name:
+                n.name = new

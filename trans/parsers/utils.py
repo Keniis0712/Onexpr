@@ -52,21 +52,43 @@ def strip_arg_annotations(args: ast.arguments) -> dict:
     for group in (args.posonlyargs, args.args):
         for a in group:
             if a.annotation is not None:
-                annotations[a.arg] = a.annotation
+                annotations[a.arg] = _normalize_annotation(a.annotation)
                 a.annotation = None
     if args.vararg is not None:
         if args.vararg.annotation is not None:
-            annotations[args.vararg.arg] = args.vararg.annotation
+            annotations[args.vararg.arg] = _normalize_annotation(args.vararg.annotation)
             args.vararg.annotation = None
     for a in args.kwonlyargs:
         if a.annotation is not None:
-            annotations[a.arg] = a.annotation
+            annotations[a.arg] = _normalize_annotation(a.annotation)
             a.annotation = None
     if args.kwarg is not None:
         if args.kwarg.annotation is not None:
-            annotations[args.kwarg.arg] = args.kwarg.annotation
+            annotations[args.kwarg.arg] = _normalize_annotation(args.kwarg.annotation)
             args.kwarg.annotation = None
     return annotations
+
+
+def _normalize_annotation(ann: ast.expr) -> ast.expr:
+    """Rewrite a top-level `*X` annotation (PEP 646: `def f(*args: *Ts)`)
+    into `typing.Unpack[X]`. The bare `Starred` node is illegal in a
+    dict-value position, which is where the annotation ends up when we
+    rebuild `__annotations__`. CPython itself stores the annotation as
+    `typing.Unpack[Ts]` at runtime, so this is a faithful match."""
+    if isinstance(ann, ast.Starred):
+        return ast.Subscript(
+            value=ast.Attribute(
+                value=ast.Call(
+                    func=ast.Name(id='__import__', ctx=ast.Load()),
+                    args=[ast.Constant(value='typing')],
+                    keywords=[],
+                ),
+                attr='Unpack', ctx=ast.Load(),
+            ),
+            slice=ann.value,
+            ctx=ast.Load(),
+        )
+    return ann
 
 
 def _binding_target(frame: Frame, name: str) -> ast.expr:
