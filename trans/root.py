@@ -43,7 +43,14 @@ def _parse_root_inner(tree: ast.Module, replace_name: str = 'none',
             # Fall back to unparsing the tree — symtable needs source.
             src = ast.unparse(tree)
         pool = _NamePool(top_frame.reserved_names, top_frame.get_temp_var)
-        apply_mangle(tree, src, user_mangle_tags, pool)
+        type_map = None
+        if 'attrs' in user_mangle_tags:
+            # Type-driven attrs needs mypy; analyze() returns None if
+            # mypy isn't installed, in which case we fall back to the
+            # name-only heuristic.
+            from .infer import analyze
+            type_map = analyze(src)
+        apply_mangle(tree, src, user_mangle_tags, pool, type_map=type_map)
         # Refresh reserved set so subsequent temp_N allocation skips
         # whatever the mangler introduced.
         top_frame.reserved_names = collect_user_names(tree)

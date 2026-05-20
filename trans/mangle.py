@@ -161,7 +161,8 @@ def _resolve_binding(scope_path: tuple, table: symtable.SymbolTable,
 # ---------------------------------------------------------------------------
 
 class _Rewriter(ast.NodeTransformer):
-    def __init__(self, src: str, tags: set[str], pool: _NamePool):
+    def __init__(self, src: str, tags: set[str], pool: _NamePool,
+                 type_map=None):
         self.src = src
         # `attrs` rewrites every Attribute.attr; without `methods`
         # the class-body method definitions wouldn't be renamed
@@ -169,6 +170,10 @@ class _Rewriter(ast.NodeTransformer):
         if 'attrs' in tags:
             tags = tags | {'methods'}
         self.tags = tags
+        # Optional type_map (trans.infer.TypeMap) — when present,
+        # `attrs` mode skips Attribute.attr accesses whose receiver
+        # is stdlib, and only renames user-class attributes.
+        self.type_map = type_map
         self.pool = pool
         self.module_table = symtable.symtable(src, '<onexpr-mangle>', 'exec')
         self.scope_stack: list[symtable.SymbolTable] = [self.module_table]
@@ -655,10 +660,53 @@ class _Rewriter(ast.NodeTransformer):
         if _is_safe_name(node.attr):
             return node
         if 'attrs' in self.tags:
-            # Rewrite EVERY non-dunder attribute through member_map.
-            # Names not in member_map (because they aren't class
-            # members in this source file either) get a fresh entry
-            # so the same name maps consistently.
+            # If mypy says the receiver is a user class → mangle.
+            # If it says stdlib AND the attr name is not a member of
+            # any user class → skip. This guards against a class of
+            # mypy mistakes (rebinding `a = 1; a = MyClass(...)` ends
+            # up keeping the int type) without trusting mypy beyond
+            # what we can cross-check via the AST.
+            if self.type_map is not None:
+                info = self.type_map.lookup(
+                    node.lineno, node.col_offset, node.attr,
+                )
+                # Receiver is definitely stdlib OR mypy gave up (Any) —
+                # in either case, only mangle when the attr name is
+                # also known as a member of some user class. This
+                # protects stdlib API names like list.append while
+                # still catching e.g. self.field on an unannotated
+                # class.
+                if info.kind in ('stdlib', 'any') and node.attr not in self.class_member_names:
+                    return node
+                if info.kind == 'user':
+                    if node.attr not in self.member_map:
+                        self.member_map[node.attr] = self.pool.allocator()
+                    node.attr = self.member_map[node.attr]
+                    return node
+                # Fall through:
+                #   - 'unknown' or no entry: mypy didn't classify this
+                #     receiver. Be conservative and only rename when
+                #     the attr is a known user-class member.
+                #   - 'stdlib' / 'any' with attr in class_member_names:
+                #     mangle (collision; the fact that we know a user
+                #     class names this attr means the access is
+                #     ambiguous, so renaming keeps the obfuscation
+                #     consistent).
+                if info.kind in ('stdlib', 'any'):
+                    # attr IS in class_member_names — mangle.
+                    if node.attr not in self.member_map:
+                        self.member_map[node.attr] = self.pool.allocator()
+                    node.attr = self.member_map[node.attr]
+                    return node
+                # 'unknown': only mangle when attr is a known
+                # user-class member.
+                if node.attr in self.class_member_names:
+                    if node.attr not in self.member_map:
+                        self.member_map[node.attr] = self.pool.allocator()
+                    node.attr = self.member_map[node.attr]
+                return node
+            # No type map at all (mypy not installed): name-only
+            # heuristic — rewrite EVERY non-dunder attribute.
             if node.attr not in self.member_map:
                 self.member_map[node.attr] = self.pool.allocator()
             node.attr = self.member_map[node.attr]
@@ -671,7 +719,8 @@ class _Rewriter(ast.NodeTransformer):
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def apply_mangle(tree: ast.AST, src: str, tags: set[str], pool: _NamePool) -> ast.AST:
+def apply_mangle(tree: ast.AST, src: str, tags: set[str], pool: _NamePool,
+                 type_map=None) -> ast.AST:
     """Run the configured user-code mangle pass over `tree`.
 
     `tree` must be the AST that was parsed from `src` — symtable is
@@ -680,11 +729,15 @@ def apply_mangle(tree: ast.AST, src: str, tags: set[str], pool: _NamePool) -> as
 
     `pool` allocates fresh names from the same Frame counter so the
     later passes don't collide. Returns the (mutated) tree.
+
+    `type_map` is an optional `trans.infer.TypeMap` (built by mypy
+    when available); used to refine `attrs` so stdlib API names
+    aren't renamed.
     """
     if not tags - {'helper'}:
         # Nothing for this pass to do — only the helper tag is set,
         # which add_helper handles itself.
         return tree
-    rewriter = _Rewriter(src, tags, pool)
+    rewriter = _Rewriter(src, tags, pool, type_map=type_map)
     rewriter.visit(tree)
     return tree
