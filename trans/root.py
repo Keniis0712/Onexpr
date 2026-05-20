@@ -3,12 +3,14 @@ import sys
 
 from .frame import Frame
 from .helpers import add_helper
+from .mangle import apply_mangle, expand_tags, _NamePool
 from .nonlocals import apply_nonlocal_pass
 from .parsers import parse_stmts
 from .passes import SuperTransformer, collect_user_names
 
 
-def parse_root(tree: ast.Module, replace_name: str = 'none') -> ast.Module:
+def parse_root(tree: ast.Module, replace_name: str = 'none',
+               src: str | None = None) -> ast.Module:
     # The transform recurses through the AST several times — for big
     # source files (e.g. CPython's own test_grammar.py with very
     # nested data literals) the default recursion limit can be too
@@ -18,14 +20,33 @@ def parse_root(tree: ast.Module, replace_name: str = 'none') -> ast.Module:
     # Leave the limit raised — restoring it here would break unparse.
     if sys.getrecursionlimit() < 5000:
         sys.setrecursionlimit(5000)
-    return _parse_root_inner(tree, replace_name=replace_name)
+    return _parse_root_inner(tree, replace_name=replace_name, src=src)
 
 
-def _parse_root_inner(tree: ast.Module, replace_name: str = 'none') -> ast.Module:
+def _parse_root_inner(tree: ast.Module, replace_name: str = 'none',
+                      src: str | None = None) -> ast.Module:
+    tags = expand_tags(replace_name)
+
     # Init the top frame
     top_frame = Frame(None, [], [])
     top_frame.temp_var_num = 0
     top_frame.reserved_names = collect_user_names(tree)
+
+    # Pre-mangle pass for the user-code tags. Must run *before*
+    # SuperTransformer / nonlocal / add_helper, so all later passes
+    # see the mangled identifiers and stay consistent. Reuses the
+    # frame's temp counter so generated mangle names won't collide
+    # with subsequent temp_N allocations.
+    user_mangle_tags = tags & {'toplevel', 'imports', 'locals', 'methods', 'attrs'}
+    if user_mangle_tags:
+        if src is None:
+            # Fall back to unparsing the tree — symtable needs source.
+            src = ast.unparse(tree)
+        pool = _NamePool(top_frame.reserved_names, top_frame.get_temp_var)
+        apply_mangle(tree, src, user_mangle_tags, pool)
+        # Refresh reserved set so subsequent temp_N allocation skips
+        # whatever the mangler introduced.
+        top_frame.reserved_names = collect_user_names(tree)
 
     # Transform "super()" to "super(cls, self)"
     super_trans = SuperTransformer()
@@ -47,7 +68,7 @@ def _parse_root_inner(tree: ast.Module, replace_name: str = 'none') -> ast.Modul
         top_frame=top_frame,
     )
 
-    add_helper(tree, top_frame, replace_name=replace_name)
+    add_helper(tree, top_frame, replace_name='global' if 'helper' in tags else 'none')
 
     expr = parse_stmts(tree.body, top_frame)
     return ast.Module(

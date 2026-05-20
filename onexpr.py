@@ -20,7 +20,7 @@ def _transform_file(input_path: str, output_path: str, replace_name: str = 'none
     with open(input_path, encoding='utf-8') as f:
         old_code = f.read()
     ast_tree = ast.parse(old_code)
-    new_tree = trans.parse_root(ast_tree, replace_name=replace_name)
+    new_tree = trans.parse_root(ast_tree, replace_name=replace_name, src=old_code)
     new_code = ast.unparse(new_tree)
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(new_code)
@@ -46,15 +46,18 @@ def main():
                         help='Bundle mode: stop after bundling (skip the '
                              'expression transform). Output is plain '
                              'single-file Python.')
-    parser.add_argument('--replace-name', choices=['none', 'global'],
-                        default='none',
-                        help='Identifier mangling. "none" (default) keeps '
-                             'helper class / member names readable. '
-                             '"global" assumes the output is a self-'
-                             'contained file and renames every helper '
-                             'class + member to a fresh temp_N — useful '
-                             'for obfuscation, breaks any tooling that '
-                             'introspects the helpers by name.')
+    parser.add_argument('--replace-name', default='none',
+                        help='Identifier mangling. CSV of tags: '
+                             'helper (rename runtime helper class / '
+                             'member names), toplevel (top-level def / '
+                             'class names), imports (import bindings), '
+                             'locals (function params + local vars), '
+                             'methods (class method names + class-defined '
+                             'self.X / cls.X attrs), attrs (every '
+                             'non-dunder attribute access — aggressive). '
+                             'Aliases: none (default), '
+                             'safe = helper,toplevel,imports,locals,methods, '
+                             'all = safe + attrs.')
     args = parser.parse_args()
 
     if args.bundle is not None:
