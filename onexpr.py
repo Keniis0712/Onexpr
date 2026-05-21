@@ -16,11 +16,17 @@ def _confirm_overwrite(path: str) -> bool:
     return choice.lower() == 'y'
 
 
-def _transform_file(input_path: str, output_path: str, replace_name: str = 'none') -> None:
+def _transform_file(input_path: str, output_path: str,
+                    replace_name: str = 'none',
+                    strip: str = 'none',
+                    strip_asserts: bool = False) -> None:
     with open(input_path, encoding='utf-8') as f:
         old_code = f.read()
     ast_tree = ast.parse(old_code)
-    new_tree = trans.parse_root(ast_tree, replace_name=replace_name, src=old_code)
+    new_tree = trans.parse_root(
+        ast_tree, replace_name=replace_name, src=old_code,
+        strip=strip, strip_asserts=strip_asserts,
+    )
     new_code = ast.unparse(new_tree)
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(new_code)
@@ -62,6 +68,25 @@ def main():
                              'Aliases: none (default), '
                              'safe = helper,toplevel,imports,locals,methods, '
                              'all = safe + attrs.')
+    parser.add_argument('--strip', default='none',
+                        help='Strip cosmetic AST elements. CSV of '
+                             'tags: docs (drop module / class / '
+                             'function docstrings), annotations '
+                             '(drop function param + return '
+                             'annotations and module / function-body '
+                             'AnnAssign annotations; class-body '
+                             'AnnAssigns are auto-preserved for '
+                             'dataclass / pydantic). Aliases: none '
+                             '(default), all = docs,annotations. '
+                             'Use a `# obfuscate: keep` comment '
+                             'above or on the same line as a node '
+                             'to protect that single node from '
+                             'stripping.')
+    parser.add_argument('--strip-asserts', action='store_true',
+                        help='Drop `assert` statements. Separate '
+                             'flag because asserts have runtime '
+                             'effects, unlike docstrings / '
+                             'annotations.')
     args = parser.parse_args()
 
     if args.bundle is not None:
@@ -82,7 +107,11 @@ def _run_single(args) -> None:
         return
     if not _confirm_overwrite(args.output):
         return
-    _transform_file(args.input, args.output, replace_name=args.replace_name)
+    _transform_file(
+        args.input, args.output,
+        replace_name=args.replace_name,
+        strip=args.strip, strip_asserts=args.strip_asserts,
+    )
 
 
 def _run_bundle(args) -> None:
@@ -128,7 +157,11 @@ def _run_bundle(args) -> None:
             tmp_path = tmp.name
         try:
             bundle.build(Path(src_root), args.package, args.entry, Path(tmp_path))
-            _transform_file(tmp_path, args.output, replace_name=post_replace_name)
+            _transform_file(
+                tmp_path, args.output,
+                replace_name=post_replace_name,
+                strip=args.strip, strip_asserts=args.strip_asserts,
+            )
         finally:
             try:
                 os.unlink(tmp_path)

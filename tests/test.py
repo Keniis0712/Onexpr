@@ -167,5 +167,54 @@ if x > 5:
             self.assertIn(required_type, presence)
 
 
+class TestStrip(unittest.TestCase):
+    """The strip pass shouldn't change observable behaviour for code
+    that doesn't read its own __doc__ / __annotations__. Run each
+    --strip mode through t_strip_basic.py and confirm stdout
+    matches.
+    """
+
+    def _run(self, mode, asserts=False, fixture='t_strip_basic.py'):
+        with open(fixture, 'r', encoding='utf-8') as f:
+            src = f.read()
+        tree = ast.parse(src)
+        out = trans.parse_root(
+            tree, src=src, strip=mode, strip_asserts=asserts,
+        )
+        out_path = f'output/output_strip_{mode}_{fixture}'
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write(ast.unparse(out))
+        # original
+        orig = subprocess.run(
+            [sys.executable, fixture],
+            capture_output=True, text=True, timeout=10,
+        )
+        new = subprocess.run(
+            [sys.executable, out_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(orig.returncode, 0,
+                         f'baseline failed: {orig.stderr}')
+        self.assertEqual(new.returncode, 0,
+                         f'strip={mode} failed: {new.stderr}')
+        self.assertEqual(orig.stdout, new.stdout,
+                         f'strip={mode} stdout drift')
+
+    def test_strip_none(self):
+        self._run('none')
+
+    def test_strip_docs(self):
+        self._run('docs')
+
+    def test_strip_annotations(self):
+        self._run('annotations')
+
+    def test_strip_all(self):
+        self._run('all')
+
+    def test_strip_asserts(self):
+        self._run('none', asserts=True)
+
+
 if __name__ == '__main__':
     unittest.main()

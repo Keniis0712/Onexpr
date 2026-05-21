@@ -7,10 +7,13 @@ from .mangle import apply_mangle, expand_tags, _NamePool
 from .nonlocals import apply_nonlocal_pass
 from .parsers import parse_stmts
 from .passes import SuperTransformer, collect_user_names
+from .strip import apply_strip, expand_strip_tags
 
 
 def parse_root(tree: ast.Module, replace_name: str = 'none',
-               src: str | None = None) -> ast.Module:
+               src: str | None = None,
+               strip: str = 'none',
+               strip_asserts: bool = False) -> ast.Module:
     # The transform recurses through the AST several times — for big
     # source files (e.g. CPython's own test_grammar.py with very
     # nested data literals) the default recursion limit can be too
@@ -20,12 +23,18 @@ def parse_root(tree: ast.Module, replace_name: str = 'none',
     # Leave the limit raised — restoring it here would break unparse.
     if sys.getrecursionlimit() < 5000:
         sys.setrecursionlimit(5000)
-    return _parse_root_inner(tree, replace_name=replace_name, src=src)
+    return _parse_root_inner(
+        tree, replace_name=replace_name, src=src,
+        strip=strip, strip_asserts=strip_asserts,
+    )
 
 
 def _parse_root_inner(tree: ast.Module, replace_name: str = 'none',
-                      src: str | None = None) -> ast.Module:
+                      src: str | None = None,
+                      strip: str = 'none',
+                      strip_asserts: bool = False) -> ast.Module:
     tags = expand_tags(replace_name)
+    strip_tags = expand_strip_tags(strip)
 
     # Init the top frame
     top_frame = Frame(None, [], [])
@@ -65,6 +74,15 @@ def _parse_root_inner(tree: ast.Module, replace_name: str = 'none',
         # Refresh reserved set so subsequent temp_N allocation skips
         # whatever the mangler introduced.
         top_frame.reserved_names = collect_user_names(tree)
+
+    # Strip pass — run after mangle (mangle's mypy step needs
+    # annotations) but before SuperTransformer / nonlocal. The
+    # nonlocal pass and add_helper don't read docstrings or
+    # annotations, so removing them here is safe.
+    if strip_tags or strip_asserts:
+        if src is None:
+            src = ast.unparse(tree)
+        apply_strip(tree, src, strip_tags, strip_asserts=strip_asserts)
 
     # Transform "super()" to "super(cls, self)"
     super_trans = SuperTransformer()
