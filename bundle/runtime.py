@@ -20,6 +20,61 @@ def _bnd_register(name, kind, init, src):
     fname = f"<bundle:{name}>"
     _bnd_linecache.cache[fname] = (len(src), None, src.splitlines(True), fname)
 
+def _bnd_rebind_globals(mod):
+    """After a module's init runs, every function it defined has
+    ``__globals__`` pointing at the bundle file's globals (because
+    each function is created inside the init function's frame, whose
+    f_globals is the bundle's). That breaks `globals()` calls and
+    `__name__` lookups in user code. Rebind every FunctionType in
+    mod.__dict__ to point at mod.__dict__ instead.
+
+    To keep references to bundle-level runtime helpers (`_FuncHelper`,
+    `_LazyAlias`, etc. — anything injected before the user code) still
+    resolvable from the rebound functions, we first copy any
+    bundle-global names that aren't already on the module. This way
+    `globals()` from inside the module sees the module's own state
+    AND can still reach the helpers as a fallback.
+
+    Functions with non-empty ``__closure__`` are left untouched —
+    rebinding ``__globals__`` would unbind their captured cells.
+    """
+    # Copy bundle-level names that look like internal helpers (begin
+    # with `_` but aren't dunders) so onexpr-injected runtime classes
+    # like `_FuncHelper` stay visible from rebound functions.
+    # Public bundle-level names (`sys`, `_BND_MODULES`, etc.) would
+    # leak into user globals() output and are not needed by user
+    # code — leave them out.
+    bundle_globals = globals()
+    for k, v in bundle_globals.items():
+        if not k.startswith('_') or k.startswith('__'):
+            continue
+        if k.startswith('_BND_') or k.startswith('_bnd_'):
+            continue
+        if k in mod.__dict__:
+            continue
+        mod.__dict__[k] = v
+    for k, v in list(mod.__dict__.items()):
+        if not isinstance(v, _bnd_types.FunctionType):
+            continue
+        if v.__globals__ is mod.__dict__:
+            continue
+        if v.__closure__:
+            # Has free variables — leave it alone.
+            continue
+        new = _bnd_types.FunctionType(
+            v.__code__, mod.__dict__, v.__name__,
+            v.__defaults__, v.__closure__,
+        )
+        new.__kwdefaults__ = v.__kwdefaults__
+        new.__doc__ = v.__doc__
+        new.__dict__.update(v.__dict__)
+        new.__module__ = mod.__name__
+        try:
+            new.__qualname__ = v.__qualname__
+        except AttributeError:
+            pass
+        mod.__dict__[k] = new
+
 def _bnd_load(name):
     m = _bnd_sys.modules.get(name)
     if m is not None:
@@ -47,6 +102,7 @@ def _bnd_load(name):
     except BaseException:
         _bnd_sys.modules.pop(name, None)
         raise
+    _bnd_rebind_globals(mod)
     return mod
 
 def _bnd_star(dst, src):

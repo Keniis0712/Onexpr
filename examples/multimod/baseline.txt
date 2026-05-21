@@ -1,0 +1,7 @@
+count: 3
+repr: Database(n=3)
+alice: {'role': 'admin', 'age': 32}
+admins: ['alice']
+age>=30: ['alice', 'cara']
+after delete count: 2
+latest id: 3

@@ -106,4 +106,9 @@ def collect_user_names(tree: ast.AST) -> set:
             names.add(node.arg)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
+        elif isinstance(node, ast.Attribute):
+            # Pre-mangling can leave temp_N names as attribute names
+            # (e.g. `self.temp_3 = ...`); the post-bundle onexpr pass
+            # must not allocate the same name to a helper class.
+            names.add(node.attr)
     return names

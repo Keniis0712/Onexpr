@@ -61,6 +61,15 @@ class _LazyAlias:
             params = (params,)
         return _types.GenericAlias(self, params)
 
+    def __or__(self, other):
+        # Real TypeAliasType supports `Vec | None` via __or__ on the
+        # C side. Mirror that: build a Union via typing.Union to
+        # match get_args / typing.get_origin output.
+        return _typing.Union[self, other]
+
+    def __ror__(self, other):
+        return _typing.Union[other, self]
+
     def __repr__(self):
         return self.__name__
 

@@ -53,8 +53,12 @@ def main():
                              'class names), imports (import bindings), '
                              'locals (function params + local vars), '
                              'methods (class method names + class-defined '
-                             'self.X / cls.X attrs), attrs (every '
-                             'non-dunder attribute access — aggressive). '
+                             'self.X / cls.X attrs; consults mypy when '
+                             'available to avoid mangling stdlib calls '
+                             'that happen to share a method name), '
+                             'attrs (every non-dunder Attribute.attr; '
+                             'REQUIRES mypy — uses inferred receiver '
+                             'types to leave stdlib API names alone). '
                              'Aliases: none (default), '
                              'safe = helper,toplevel,imports,locals,methods, '
                              'all = safe + attrs.')
@@ -85,24 +89,58 @@ def _run_bundle(args) -> None:
     if not _confirm_overwrite(args.output):
         return
 
-    if args.bundle_only:
-        # Bundle straight to the requested output, skip the expression pass.
-        bundle.build(Path(args.bundle), args.package, args.entry, Path(args.output))
-        return
+    # User-code mangle tags (`locals`, `methods`, `attrs`) apply to
+    # the original source files: doing them after bundling would
+    # confuse mypy (it would see the synthetic _M_xxx functions, not
+    # the user's classes). Pre-mangle in a temp tree, then bundle
+    # that. `toplevel` / `imports` stay disabled in this stage —
+    # they would rewrite the export surface the bundler relies on.
+    from trans.mangle import expand_tags, premangle_package
+    tags = expand_tags(args.replace_name)
+    premangle_tags = tags & {'locals', 'methods', 'attrs'}
 
-    # Bundle to a temp file first, then run the onexpr transform on it.
-    with tempfile.NamedTemporaryFile(
-        mode='w', suffix='.py', delete=False, encoding='utf-8'
-    ) as tmp:
-        tmp_path = tmp.name
+    src_root = args.bundle
+    cleanup_premangle: list[str] = []
+    if premangle_tags:
+        premangle_dir = tempfile.mkdtemp(prefix='onexpr-mangle-')
+        cleanup_premangle.append(premangle_dir)
+        premangle_package(args.bundle, args.package, premangle_tags,
+                          premangle_dir)
+        src_root = premangle_dir
+
+    # After pre-mangling user code we don't want the post-bundle
+    # onexpr step to re-run user-code mangling — it would see the
+    # synthetic _M_xxx functions and get confused. Restrict the
+    # remaining tags to `helper` only.
+    post_replace_name = 'helper' if 'helper' in tags else 'none'
+
     try:
-        bundle.build(Path(args.bundle), args.package, args.entry, Path(tmp_path))
-        _transform_file(tmp_path, args.output, replace_name=args.replace_name)
-    finally:
+        if args.bundle_only:
+            # Bundle straight to the requested output, skip the
+            # expression pass. Helper / toplevel / etc. were never
+            # going to apply in --bundle-only either.
+            bundle.build(Path(src_root), args.package, args.entry, Path(args.output))
+            return
+
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.py', delete=False, encoding='utf-8'
+        ) as tmp:
+            tmp_path = tmp.name
         try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+            bundle.build(Path(src_root), args.package, args.entry, Path(tmp_path))
+            _transform_file(tmp_path, args.output, replace_name=post_replace_name)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    finally:
+        import shutil
+        for d in cleanup_premangle:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                pass
 
 
 if __name__ == '__main__':

@@ -43,9 +43,21 @@ def emit_module_function(modname: str, kind: str, source: str,
 
     new_body: list[ast.stmt] = []
     for stmt in tree.body:
+        # Track which walrus targets had been seen before this stmt;
+        # any new ones come from rewriting THIS stmt.
+        before = set(rewriter.walrus_module_targets)
         out = rewriter.visit(stmt)
         items = out if isinstance(out, list) else [out]
         new_body.extend(items)
+        new_walrus = rewriter.walrus_module_targets - before
+        for nm in sorted(new_walrus):
+            new_body.append(ast.Assign(
+                targets=[ast.Attribute(
+                    value=ast.Name(id="_mod", ctx=ast.Load()),
+                    attr=nm, ctx=ast.Store(),
+                )],
+                value=ast.Name(id=nm, ctx=ast.Load()),
+            ))
         # top-level def/class: mirror name onto _mod and fix __module__
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             nm = stmt.name
@@ -61,6 +73,15 @@ def emit_module_function(modname: str, kind: str, source: str,
                 handlers=[ast.ExceptHandler(type=ast.Name(id="Exception", ctx=ast.Load()),
                                             name=None, body=[ast.Pass()])],
                 orelse=[], finalbody=[]))
+            new_body.append(ast.Delete(targets=[ast.Name(id=nm, ctx=ast.Del())]))
+        elif isinstance(stmt, ast.TypeAlias) and isinstance(stmt.name, ast.Name):
+            # PEP 695 type alias: the bare Name must stay (we left it
+            # alone in the rewriter), but we still want it on _mod.
+            nm = stmt.name.id
+            new_body.append(ast.Assign(
+                targets=[ast.Attribute(value=ast.Name(id="_mod", ctx=ast.Load()),
+                                       attr=nm, ctx=ast.Store())],
+                value=ast.Name(id=nm, ctx=ast.Load())))
             new_body.append(ast.Delete(targets=[ast.Name(id=nm, ctx=ast.Del())]))
 
     # ensure module-level dunders are set on _mod even if user code reads them

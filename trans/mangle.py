@@ -162,7 +162,8 @@ def _resolve_binding(scope_path: tuple, table: symtable.SymbolTable,
 
 class _Rewriter(ast.NodeTransformer):
     def __init__(self, src: str, tags: set[str], pool: _NamePool,
-                 type_map=None):
+                 type_map=None, shared_member_map: dict | None = None,
+                 shared_class_member_names: set | None = None):
         self.src = src
         # `attrs` rewrites every Attribute.attr; without `methods`
         # the class-body method definitions wouldn't be renamed
@@ -174,6 +175,13 @@ class _Rewriter(ast.NodeTransformer):
         # `attrs` mode skips Attribute.attr accesses whose receiver
         # is stdlib, and only renames user-class attributes.
         self.type_map = type_map
+        # Optional shared member_map / class_member_names: when
+        # mangling several modules in sequence, the same attribute
+        # name must mangle to the same temp_N across all of them so
+        # cross-module calls (foo.member where foo is defined in
+        # another module) keep working. Pass the same dicts in.
+        self._shared_member_map = shared_member_map
+        self._shared_class_member_names = shared_class_member_names
         self.pool = pool
         self.module_table = symtable.symtable(src, '<onexpr-mangle>', 'exec')
         self.scope_stack: list[symtable.SymbolTable] = [self.module_table]
@@ -184,7 +192,10 @@ class _Rewriter(ast.NodeTransformer):
         # set is enough — we don't track which class, because (a)
         # one symbol-name can mean only one thing in Python's dot
         # syntax, (b) inheritance breaks any narrower invariant.
-        self.class_member_names: set[str] = set()
+        if shared_class_member_names is not None:
+            self.class_member_names = shared_class_member_names
+        else:
+            self.class_member_names = set()
         if 'methods' in self.tags or 'attrs' in self.tags:
             self._collect_class_members()
 
@@ -196,11 +207,15 @@ class _Rewriter(ast.NodeTransformer):
         # _collect_bindings, before scope traversal, so the cache is
         # primed for both `binding_to_mangle` lookups (in class scope)
         # and Attribute.attr rewrites.
-        self.member_map: dict[str, str] = {}
+        if shared_member_map is not None:
+            self.member_map = shared_member_map
+        else:
+            self.member_map = {}
         for n in self.class_member_names:
             if _is_safe_name(n):
                 continue
-            self.member_map[n] = self.pool.allocator()
+            if n not in self.member_map:
+                self.member_map[n] = self.pool.allocator()
 
         # For every class-scope binding whose name is in member_map,
         # pre-seed the pool cache so visiting the method's FunctionDef
@@ -660,57 +675,44 @@ class _Rewriter(ast.NodeTransformer):
         if _is_safe_name(node.attr):
             return node
         if 'attrs' in self.tags:
-            # If mypy says the receiver is a user class → mangle.
-            # If it says stdlib AND the attr name is not a member of
-            # any user class → skip. This guards against a class of
-            # mypy mistakes (rebinding `a = 1; a = MyClass(...)` ends
-            # up keeping the int type) without trusting mypy beyond
-            # what we can cross-check via the AST.
+            # `attrs` requires type info (the CLI enforces this).
+            # Decision tree (receiver kind ∈ {user, stdlib, any, unknown}):
+            #   user      → mangle (it's the user class's attribute).
+            #   stdlib    → skip   (it's a stdlib API; renaming would break
+            #                       e.g. dict.get when a user class also has
+            #                       a method called `get`).
+            #   any       → mangle only if attr is a user-class member.
+            #                       mypy gave up on the receiver type; if
+            #                       the attr name matches a user member,
+            #                       err on the safe side (mangle).
+            #   unknown   → mangle only if attr is a user-class member.
+            assert self.type_map is not None
+            info = self.type_map.lookup(
+                node.lineno, node.col_offset, node.attr,
+            )
+            if info.kind == 'user':
+                if node.attr not in self.member_map:
+                    self.member_map[node.attr] = self.pool.allocator()
+                node.attr = self.member_map[node.attr]
+                return node
+            if info.kind == 'stdlib':
+                return node
+            # 'any' / 'unknown': mangle only when attr is also a
+            # known user-class member.
+            if node.attr in self.class_member_names:
+                if node.attr not in self.member_map:
+                    self.member_map[node.attr] = self.pool.allocator()
+                node.attr = self.member_map[node.attr]
+            return node
+        elif 'methods' in self.tags and node.attr in self.member_map:
+            # Same logic as attrs but only when the attr is already
+            # known to be a user-class member.
             if self.type_map is not None:
                 info = self.type_map.lookup(
                     node.lineno, node.col_offset, node.attr,
                 )
-                # Receiver is definitely stdlib OR mypy gave up (Any) —
-                # in either case, only mangle when the attr name is
-                # also known as a member of some user class. This
-                # protects stdlib API names like list.append while
-                # still catching e.g. self.field on an unannotated
-                # class.
-                if info.kind in ('stdlib', 'any') and node.attr not in self.class_member_names:
+                if info.kind == 'stdlib':
                     return node
-                if info.kind == 'user':
-                    if node.attr not in self.member_map:
-                        self.member_map[node.attr] = self.pool.allocator()
-                    node.attr = self.member_map[node.attr]
-                    return node
-                # Fall through:
-                #   - 'unknown' or no entry: mypy didn't classify this
-                #     receiver. Be conservative and only rename when
-                #     the attr is a known user-class member.
-                #   - 'stdlib' / 'any' with attr in class_member_names:
-                #     mangle (collision; the fact that we know a user
-                #     class names this attr means the access is
-                #     ambiguous, so renaming keeps the obfuscation
-                #     consistent).
-                if info.kind in ('stdlib', 'any'):
-                    # attr IS in class_member_names — mangle.
-                    if node.attr not in self.member_map:
-                        self.member_map[node.attr] = self.pool.allocator()
-                    node.attr = self.member_map[node.attr]
-                    return node
-                # 'unknown': only mangle when attr is a known
-                # user-class member.
-                if node.attr in self.class_member_names:
-                    if node.attr not in self.member_map:
-                        self.member_map[node.attr] = self.pool.allocator()
-                    node.attr = self.member_map[node.attr]
-                return node
-            # No type map at all (mypy not installed): name-only
-            # heuristic — rewrite EVERY non-dunder attribute.
-            if node.attr not in self.member_map:
-                self.member_map[node.attr] = self.pool.allocator()
-            node.attr = self.member_map[node.attr]
-        elif 'methods' in self.tags and node.attr in self.member_map:
             node.attr = self.member_map[node.attr]
         return node
 
@@ -720,7 +722,8 @@ class _Rewriter(ast.NodeTransformer):
 # ---------------------------------------------------------------------------
 
 def apply_mangle(tree: ast.AST, src: str, tags: set[str], pool: _NamePool,
-                 type_map=None) -> ast.AST:
+                 type_map=None, shared_member_map: dict | None = None,
+                 shared_class_member_names: set | None = None) -> ast.AST:
     """Run the configured user-code mangle pass over `tree`.
 
     `tree` must be the AST that was parsed from `src` — symtable is
@@ -733,11 +736,172 @@ def apply_mangle(tree: ast.AST, src: str, tags: set[str], pool: _NamePool,
     `type_map` is an optional `trans.infer.TypeMap` (built by mypy
     when available); used to refine `attrs` so stdlib API names
     aren't renamed.
+
+    `shared_member_map` / `shared_class_member_names`: when mangling
+    several modules of one package, pass the same dict / set in each
+    call. The same attribute name then mangles consistently across
+    modules.
     """
     if not tags - {'helper'}:
         # Nothing for this pass to do — only the helper tag is set,
         # which add_helper handles itself.
         return tree
-    rewriter = _Rewriter(src, tags, pool, type_map=type_map)
+    rewriter = _Rewriter(
+        src, tags, pool, type_map=type_map,
+        shared_member_map=shared_member_map,
+        shared_class_member_names=shared_class_member_names,
+    )
     rewriter.visit(tree)
     return tree
+
+
+# ---------------------------------------------------------------------------
+# Pre-bundle pass: rewrite each user module to a parallel tree
+# ---------------------------------------------------------------------------
+
+def premangle_package(src_root, package: str, tags: set[str],
+                      out_root) -> None:
+    """Walk `src_root/package` and write each .py file, mangled per
+    `tags`, into a mirror tree at `out_root`. Shares member_map +
+    class_member_names across modules so cross-module attribute
+    accesses keep mangling to the same names.
+
+    Skip tags that don't make sense at this stage: `toplevel` (would
+    change exported class / def names, breaking bundle import paths)
+    and `imports` (bundle rewrites every import itself).
+
+    Mypy, if available, is run per-module — analysing each user
+    module standalone gives accurate receiver types because we're
+    looking at the original source, not the bundle.
+    """
+    from pathlib import Path
+    src_root = Path(src_root)
+    out_root = Path(out_root)
+    pkg_dir = src_root / package
+    if not pkg_dir.is_dir():
+        raise SystemExit(f"package root not found: {pkg_dir}")
+
+    # `toplevel`/`imports` would break bundle linkage. The user-code
+    # tags that work pre-bundle are locals / methods / attrs.
+    safe_tags = tags & {'locals', 'methods', 'attrs'}
+    if not safe_tags:
+        # Nothing to do; just copy.
+        import shutil
+        shutil.copytree(pkg_dir, out_root / package, dirs_exist_ok=True)
+        return
+
+    type_map_needed = bool(tags & {'methods', 'attrs'})
+
+    # Shared state across modules.
+    class _SharedPool:
+        def __init__(self):
+            self.cache: dict = {}
+            self.reserved: set = set()
+            self._n = 0
+        def allocator(self):
+            while True:
+                name = f'temp_{self._n}'
+                self._n += 1
+                if name not in self.reserved:
+                    self.reserved.add(name)
+                    return name
+        def get_for(self, bid):
+            if bid not in self.cache:
+                self.cache[bid] = self.allocator()
+            return self.cache[bid]
+
+    pool = _SharedPool()
+    shared_member_map: dict = {}
+    shared_class_members: set = set()
+
+    # Run mypy *once* across the whole package so relative imports
+    # resolve and cross-module types are accurate. Without this,
+    # per-file analyze() returns None for any module with
+    # `from . import x`.
+    package_types: dict | None = None
+    if type_map_needed:
+        from .infer import analyze_package
+        package_types = analyze_package(src_root, package)
+        if package_types is None and 'attrs' in safe_tags:
+            raise SystemExit(
+                '--replace-name=attrs requires mypy to be installed'
+            )
+
+    # First pass: collect ALL class member names across the whole
+    # package, so even a class defined in module A and accessed via
+    # `a.MyClass().method` from module B gets consistent treatment.
+    if type_map_needed:
+        for path in sorted(pkg_dir.rglob('*.py')):
+            try:
+                src = path.read_text(encoding='utf-8')
+                tree = ast.parse(src)
+            except (SyntaxError, OSError):
+                continue
+            _collect_class_members_into(tree, shared_class_members)
+
+    # Second pass: rewrite each module, sharing the pool / map / set.
+    import shutil
+    for path in sorted(pkg_dir.rglob('*.py')):
+        rel = path.relative_to(src_root)
+        out_path = out_root / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            src = path.read_text(encoding='utf-8')
+        except OSError:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            # Can't mangle if it doesn't parse — just copy verbatim.
+            out_path.write_bytes(path.read_bytes())
+            continue
+
+        type_map = None
+        if package_types is not None:
+            # Look up by dotted module name.
+            module_parts = list(rel.with_suffix('').parts)
+            if module_parts[-1] == '__init__':
+                module_parts = module_parts[:-1]
+            dotted = '.'.join(module_parts)
+            type_map = package_types.get(dotted)
+
+        apply_mangle(
+            tree, src, safe_tags, pool, type_map=type_map,
+            shared_member_map=shared_member_map,
+            shared_class_member_names=shared_class_members,
+        )
+        out_path.write_text(ast.unparse(tree), encoding='utf-8')
+
+
+def _collect_class_members_into(tree: ast.AST, out: set) -> None:
+    """Same logic as _Rewriter._collect_class_members, but reusable."""
+    class _Coll(ast.NodeVisitor):
+        def __init__(self):
+            self.depth = 0
+        def visit_ClassDef(self, node):
+            self.depth += 1
+            for s in node.body:
+                if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if not _is_safe_name(s.name):
+                        out.add(s.name)
+                if isinstance(s, ast.Assign):
+                    for tgt in s.targets:
+                        if isinstance(tgt, ast.Name) and not _is_safe_name(tgt.id):
+                            out.add(tgt.id)
+                if isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name):
+                    if not _is_safe_name(s.target.id):
+                        out.add(s.target.id)
+            self.generic_visit(node)
+            self.depth -= 1
+        def visit_Attribute(self, node):
+            if (
+                self.depth > 0
+                and isinstance(node.ctx, ast.Store)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in ('self', 'cls')
+                and not _is_safe_name(node.attr)
+            ):
+                out.add(node.attr)
+            self.generic_visit(node)
+    _Coll().visit(tree)

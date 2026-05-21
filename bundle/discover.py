@@ -93,4 +93,14 @@ def collect_module_level_names(tree: ast.Module) -> set[str]:
                     names.add(h.name)
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             names.update(node.names)
+        elif isinstance(node, ast.TypeAlias):
+            # PEP 695: `type X[T] = ...`
+            if isinstance(node.name, ast.Name):
+                names.add(node.name.id)
+        elif isinstance(node, ast.Expr):
+            # Top-level expression statements may contain walrus
+            # bindings: `(x := 1)` at module top level binds x.
+            for sub in ast.walk(node.value):
+                if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name):
+                    names.add(sub.target.id)
     return names

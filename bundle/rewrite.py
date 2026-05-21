@@ -34,6 +34,11 @@ class ModuleRewriter(ast.NodeTransformer):
         self.internal = internal_modules
         self.scope_stack: list[ScopeInfo] = [scope]
         self._tmp_counter = 0
+        # Names bound by `(x := ...)` at module level. Captured by
+        # visit_NamedExpr; the emit step appends `_mod.x = x` after
+        # the surrounding statement so globals() / module attribute
+        # access sees the binding.
+        self.walrus_module_targets: set[str] = set()
 
     # -- scope tracking -------------------------------------------------------
 
@@ -82,6 +87,21 @@ class ModuleRewriter(ast.NodeTransformer):
             return ast.copy_location(self._module_attr(node.id, node.ctx), node)
         return node
 
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> ast.AST:
+        # `(x := value)` — the assignment expression's target must
+        # stay a bare Name (`(_mod.x := v)` is a SyntaxError). We
+        # leave the target alone and let the emit step mirror the
+        # bound name onto _mod after the surrounding stmt runs.
+        node.value = self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            tid = node.target.id
+            if (
+                self.scope.resolves_to_module(tid) and tid != "_mod"
+                and self.scope.table.get_type() == "module"
+            ):
+                self.walrus_module_targets.add(tid)
+        return node
+
     def visit_Global(self, node: ast.Global) -> ast.AST:
         # `global x` in a function -> already encoded in symtable; the function's
         # uses of x are rewritten to _mod.x by visit_Name. We can drop the
@@ -89,6 +109,14 @@ class ModuleRewriter(ast.NodeTransformer):
         return ast.Pass()
 
     def visit_Nonlocal(self, node: ast.Nonlocal) -> ast.AST:
+        return node
+
+    def visit_TypeAlias(self, node: ast.TypeAlias) -> ast.AST:
+        # PEP 695 `type X[T] = expr`: the LHS *must* stay a bare Name
+        # — `type _mod.X = ...` is a syntax error. Rewrite the value
+        # only; emit_module_function will mirror X onto _mod the same
+        # way it does for def/class.
+        node.value = self.visit(node.value)
         return node
 
     # nested-scope traversal must update scope_stack

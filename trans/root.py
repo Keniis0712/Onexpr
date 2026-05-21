@@ -44,12 +44,23 @@ def _parse_root_inner(tree: ast.Module, replace_name: str = 'none',
             src = ast.unparse(tree)
         pool = _NamePool(top_frame.reserved_names, top_frame.get_temp_var)
         type_map = None
-        if 'attrs' in user_mangle_tags:
-            # Type-driven attrs needs mypy; analyze() returns None if
-            # mypy isn't installed, in which case we fall back to the
-            # name-only heuristic.
+        if 'attrs' in user_mangle_tags or 'methods' in user_mangle_tags:
+            # Type info disambiguates receivers — `methods` uses it
+            # to skip stdlib calls whose attribute happens to share
+            # a name with a user-class member; `attrs` needs it to
+            # avoid the cliff of mangling every attribute access.
             from .infer import analyze
             type_map = analyze(src)
+            if type_map is None and 'attrs' in user_mangle_tags:
+                # `attrs` is too aggressive to run without type info —
+                # it would mangle every stdlib API call. Refuse rather
+                # than producing a broken bundle.
+                raise SystemExit(
+                    "--replace-name=attrs (or any preset that includes "
+                    "it, like `all`) requires mypy to be installed for "
+                    "type-driven attribute resolution. Install with "
+                    "`pip install mypy`, or use --replace-name=safe."
+                )
         apply_mangle(tree, src, user_mangle_tags, pool, type_map=type_map)
         # Refresh reserved set so subsequent temp_N allocation skips
         # whatever the mangler introduced.
