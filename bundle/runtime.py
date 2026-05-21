@@ -24,45 +24,94 @@ def _bnd_rebind_globals(mod):
     """After a module's init runs, every function it defined has
     ``__globals__`` pointing at the bundle file's globals (because
     each function is created inside the init function's frame, whose
-    f_globals is the bundle's). That breaks `globals()` calls and
-    `__name__` lookups in user code. Rebind every FunctionType in
-    mod.__dict__ to point at mod.__dict__ instead.
+    f_globals is the bundle's). That breaks `globals()` and
+    `__name__` lookups in user code. Rebind each FunctionType to a
+    per-module globals dict.
 
-    To keep references to bundle-level runtime helpers (`_FuncHelper`,
-    `_LazyAlias`, etc. — anything injected before the user code) still
-    resolvable from the rebound functions, we first copy any
-    bundle-global names that aren't already on the module. This way
-    `globals()` from inside the module sees the module's own state
-    AND can still reach the helpers as a fallback.
+    Subtlety: bundle-level helpers (`_FuncHelper`, `temp_N`,
+    ``_TryHelper``...) are referenced by the function's bytecode,
+    so they must be visible from the rebound function's
+    ``__globals__``. But naively copying them into ``mod.__dict__``
+    pollutes ``globals().keys()`` for user code — `temp_N` would
+    leak into anything that does ``[k for k in globals() if not
+    k.startswith('_')]``.
 
-    Functions with non-empty ``__closure__`` are left untouched —
-    rebinding ``__globals__`` would unbind their captured cells.
+    Trick: ``__globals__`` can be a ``dict`` *subclass*, and
+    ``LOAD_GLOBAL`` falls back to ``__missing__`` for keys not
+    present. So we use a subclass that:
+
+      - shares storage with ``mod.__dict__`` (every write goes to
+        ``mod.__dict__`` so ``import x.y; x.y.X = ...`` is visible
+        on the module); and
+      - resolves missing keys against the bundle's own globals,
+        where the helpers live.
+
+    Functions with a non-empty ``__closure__`` are left alone —
+    rebinding their ``__globals__`` would unbind captured cells.
     """
-    # Copy bundle-level names that look like internal helpers (begin
-    # with `_` but aren't dunders) so onexpr-injected runtime classes
-    # like `_FuncHelper` stay visible from rebound functions.
-    # Public bundle-level names (`sys`, `_BND_MODULES`, etc.) would
-    # leak into user globals() output and are not needed by user
-    # code — leave them out.
     bundle_globals = globals()
-    for k, v in bundle_globals.items():
-        if not k.startswith('_') or k.startswith('__'):
-            continue
-        if k.startswith('_BND_') or k.startswith('_bnd_'):
-            continue
-        if k in mod.__dict__:
-            continue
-        mod.__dict__[k] = v
-    for k, v in list(mod.__dict__.items()):
+    md = mod.__dict__
+
+    class _BundleScope(dict):
+        # We initialise with a single entry so the dict is non-empty;
+        # everything actually lives in ``md`` (mod.__dict__). Reads
+        # delegate; writes go to ``md`` so module-level state stays
+        # consistent for downstream importers.
+        def __getitem__(self, k):
+            try:
+                return md[k]
+            except KeyError:
+                pass
+            return bundle_globals[k]
+
+        def __setitem__(self, k, v):
+            md[k] = v
+
+        def __delitem__(self, k):
+            del md[k]
+
+        def __contains__(self, k):
+            return k in md or k in bundle_globals
+
+        def __iter__(self):
+            return iter(md)
+
+        def keys(self):
+            return md.keys()
+
+        def values(self):
+            return md.values()
+
+        def items(self):
+            return md.items()
+
+        def __len__(self):
+            return len(md)
+
+        def __missing__(self, k):
+            # Fallback path used by LOAD_GLOBAL when the bytecode
+            # ALREADY tried our subclass's regular lookup and missed.
+            try:
+                return bundle_globals[k]
+            except KeyError:
+                raise KeyError(k)
+
+        def get(self, k, default=None):
+            if k in md:
+                return md[k]
+            return bundle_globals.get(k, default)
+
+    scope = _BundleScope()
+
+    for k, v in list(md.items()):
         if not isinstance(v, _bnd_types.FunctionType):
             continue
-        if v.__globals__ is mod.__dict__:
+        if v.__globals__ is scope:
             continue
         if v.__closure__:
-            # Has free variables — leave it alone.
             continue
         new = _bnd_types.FunctionType(
-            v.__code__, mod.__dict__, v.__name__,
+            v.__code__, scope, v.__name__,
             v.__defaults__, v.__closure__,
         )
         new.__kwdefaults__ = v.__kwdefaults__
@@ -73,7 +122,7 @@ def _bnd_rebind_globals(mod):
             new.__qualname__ = v.__qualname__
         except AttributeError:
             pass
-        mod.__dict__[k] = new
+        md[k] = new
 
 def _bnd_load(name):
     m = _bnd_sys.modules.get(name)
